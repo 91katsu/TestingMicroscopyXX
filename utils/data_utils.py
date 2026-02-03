@@ -79,8 +79,9 @@ class DataNormalization:
     def forward_normalization(self, x0, norm_method, trd):
         print('forward normalization:  ', norm_method)
         if norm_method == '11':
-            x0[x0 <= trd[0]] = trd[0]
-            x0[x0 >= trd[1]] = trd[1]
+            if trd[0] != 'None' and trd[1] != 'None':
+                x0[x0 <= trd[0]] = trd[0]
+                x0[x0 >= trd[1]] = trd[1]
             # x0 = x0 / x0.max()
             x0 = (x0 - x0.min()) / (x0.max() - x0.min())
             x0 = (x0 - 0.5) * 2
@@ -89,8 +90,9 @@ class DataNormalization:
             x0 = x0.astype(np.float32)
             x0 = torch.from_numpy(x0).unsqueeze(0).unsqueeze(0).float()
         elif norm_method == '01':
-            x0[x0 <= trd[0]] = trd[0]
-            x0[x0 >= trd[1]] = trd[1]
+            if trd[0] != 'None' and trd[1] != 'None':
+                x0[x0 <= trd[0]] = trd[0]
+                x0[x0 >= trd[1]] = trd[1]
             # x0 = x0 / x0.max()
             x0 = (x0 - x0.min()) / (x0.max() - x0.min())
             x0 = torch.from_numpy(x0).unsqueeze(0).unsqueeze(0).float()

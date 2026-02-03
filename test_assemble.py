@@ -229,7 +229,7 @@ class MicroTest:
             # assemble_func = self._assemble_microscopy_volume_memmap
             assemble_func = self.assemble_microscopy_volumne
         elif self.args.assemble_method == "zarr":
-            assemble_func = self._assemble_microscopy_volume_zarr_parallel
+            assemble_func = self.assemble_microscopy_volume_zarr
         else:
             raise KeyError(f"Only support method tiff or zarr, but got {self.args.assemble_method}")
         # Do assemble
@@ -270,7 +270,6 @@ class MicroTest:
                     cropped = x[:, C0:-C0, C1:-C1, C2:-C2]
 
                     w = np.stack([w] * cropped.shape[0], axis=0)
-                    # ipdb.set_trace()
                     cropped = np.multiply(cropped, w)
                     if len(one_row) > 0:
                         one_row[-1][:, :, :, -S2:] = one_row[-1][:, :, :, -S2:] + cropped[:, :, :, :S2]
@@ -292,7 +291,7 @@ class MicroTest:
             one_column = np.concatenate(one_column, axis=2).astype(np.float32)  # (C, X, Z, Y)
 
             if last_block is not None:
-                one_column[:, :S1, ::] = one_column[:, :S1, ::] + last_block[:, -S1:, ::]
+                one_column[:, :S1, ::] = one_column[:, :S1, ::] + last_block
 
             for xx in range(0, one_column.shape[1] - S1):
                 for c in range(one_column.shape[0]):
@@ -305,9 +304,122 @@ class MicroTest:
                     tiff.imwrite(os.path.join(output_path + '_' + str(c), 'slice_x_' + str(current_x_position + xx).zfill(4) + '.tif'),
                                  slice_data.astype(np.dtype(self.save_image_datatype)))
 
-            last_block = one_column
+            last_block = one_column[:, -S1:, :, :].copy()
             current_x_position += one_column.shape[1] - S1
 
+    def assemble_microscopy_volume_zarr(self, zrange, xrange, yrange, source, output_path):
+        # Compute final shape for zarr store
+        def compute_final_shape(ori_img_path, Cz, Cx, Cy, Sz, Sx, Sy, dz, dy, dx, zstep, ystep, xstep, weight_shape):
+            with tiff.TiffFile(ori_img_path) as t:
+                ori_z, ori_y, ori_x = t.series[0].shape
+            # Step 1: First, pad by crop margin (C) on both sides to preserve original size after assembly
+            Dz, Dy, Dx = ori_z + 2*Cz, ori_y + 2*Cy, ori_x + 2*Cx
+            # Step 2: Then, pad to make divisible by patch shape
+            Nz, Ny, Nx = np.ceil(Dz / dz) * dz, np.ceil(Dy / dy) * dy, np.ceil(Dx / dx) * dx
+
+            patches_z, patches_y, patches_x = np.ceil(Nz / eval(zstep)), np.ceil(Ny / eval(ystep)), np.ceil(Nx / eval(xstep))
+            final_shape = weight_shape[0] * patches_z - (patches_z - 1) * Sz, weight_shape[1] * patches_y - (patches_y - 1) * Sy, weight_shape[2] * patches_x - (patches_x - 1) * Sx - Sx
+            print(f'Final zarr output shape is: {final_shape}')
+            return final_shape
+
+        C0, C1, C2 = self.kwargs['assemble_params']['C']
+        S0, S1, S2 = self.kwargs['assemble_params']['S']
+
+        # Compute final output shape (Z, Y, X) and create zarr store
+        fZ, fY, fX = compute_final_shape(
+            os.path.join(self.kwargs['root_path'], self.kwargs['image_path'][0]),
+            C0, C1, C2, S0, S1, S2,
+            self.kwargs["upsample_params"]["size"][0],
+            self.kwargs["upsample_params"]["size"][1],
+            self.kwargs["upsample_params"]["size"][2],
+            self.kwargs['assemble_params']['zrange'][-1],
+            self.kwargs['assemble_params']['yrange'][-1],
+            self.kwargs['assemble_params']['xrange'][-1],
+            self.kwargs['assemble_params']['weight_shape'],
+        )
+        fZ, fY, fX = int(fZ), int(fY), int(fX)
+        C = self.kwargs['output_channel']
+        save_dtype = np.dtype(self.save_image_datatype)
+
+        # TCZYX 5D shape for OME-Zarr compatibility
+        # Store X as zarr Z-axis (side view), so TCZYX = (1, C, X, Z, Y)
+        shape_5d = (1, C, fX, fZ, fY)
+        chunks_5d = (1, 1, 20, 512, 512)
+
+        zarr_path = output_path + '_' + str(C) + '.zarr'
+        store = zarr.DirectoryStore(zarr_path)
+        root = zarr.open_group(store, mode="w")
+        zarr_out = root.create_dataset(
+            "0",
+            shape=shape_5d,
+            chunks=chunks_5d,
+            dtype=save_dtype,
+            fill_value=0,
+        )
+        print(f"[zarr] Created store: {zarr_path}, shape TCZYX={shape_5d}")
+
+        last_block = None
+        current_x_position = 0
+        for nx in tqdm(range(len(xrange))):
+            one_column = []
+            for nz in range(len(zrange)):
+                one_row = []
+                for ny in range(len(yrange)):
+                    # get weight
+                    if nx == len(xrange) - 1:
+                        nx = -1
+                    if ny == len(yrange) - 1:
+                        ny = -1
+                    if nz == len(zrange) - 1:
+                        nz = -1
+
+                    iz = zrange[nz]
+                    ix = xrange[nx]
+                    iy = yrange[ny]
+
+                    w = create_tapered_weight(S0, S1, S2, nz, nx, ny, size=self.kwargs['assemble_params']['weight_shape'],
+                                              edge_size=64)
+                    # load and crop
+                    x = tiff.imread(source + str(iz) + '_' + str(ix) + '_' + str(iy) + '.tif')
+                    cropped = x[:, C0:-C0, C1:-C1, C2:-C2]
+
+                    w = np.stack([w] * cropped.shape[0], axis=0)
+                    cropped = np.multiply(cropped, w)
+                    if len(one_row) > 0:
+                        one_row[-1][:, :, :, -S2:] = one_row[-1][:, :, :, -S2:] + cropped[:, :, :, :S2]
+                        one_row.append(cropped[:, :, :, S2:])
+                    else:
+                        one_row.append(cropped)
+
+                one_row = np.concatenate(one_row, axis=3)  # (C, Z, X, Y)
+                one_row = np.transpose(one_row, (0, 2, 1, 3))  # (C, X, Z, Y)
+
+                if len(one_column) > 0:
+                    one_column[-1][:, :, -S0:, :] = one_column[-1][:, :, -S0:, :] + one_row[:, :, :S0, :]
+                    one_column.append(one_row[:, :, S0:, :])
+                else:
+                    one_column.append(one_row)
+
+            one_column = np.concatenate(one_column, axis=2).astype(np.float32)  # (C, X, Z, Y)
+
+            if last_block is not None:
+                one_column[:, :S1, ::] = one_column[:, :S1, ::] + last_block
+
+            # Write block to zarr: TCZYX = (1, C, X, Z, Y)
+            # one_column is (C, X, Z, Y), directly maps to zarr (C, Z_zarr, Y_zarr, X_zarr)
+            block = one_column[:, :one_column.shape[1] - S1, :, :]
+            if self.save_image_datatype == 'uint8':
+                block = np.clip(block, 0, 255)
+            elif self.save_image_datatype == 'uint16':
+                block = np.clip(block, 0, 65535)
+            block = block.astype(save_dtype)
+            x_len = block.shape[1]
+            zarr_out[0, :, current_x_position:current_x_position + x_len, :, :] = block
+
+            last_block = one_column[:, -S1:, :, :].copy()
+            current_x_position += one_column.shape[1] - S1
+
+        print(f"[zarr] Assembly complete: {zarr_path}")
 
     def _test_time_augementation(self, x, method):
         axis_mapping_func = {"Z": 0, "X": 2, "Y": 3}
