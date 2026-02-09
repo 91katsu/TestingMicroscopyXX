@@ -15,9 +15,9 @@ DEFAULT:
     xrange: [ 0, 1024 - 13 * 16, 13 * 16 ] #3624 - 13*16, 13 * 16]
     yrange: [ 0, 1024 - 13 * 16,  13 * 16 ]
   mc: 1
-  input_augmentation: [null, 'transpose'] #, 'flipX', 'flipY']
+  input_augmentation: [null, 'transpose'] # ['flipX', 'flipY']
   output_channel: 1
-# (256 - 2 * S - C) = 16 * 13
+# (256 - 2 * S - C) = 16 * 13`
 ENC:
   dataset: "filopodia_10X_G0431__6xGFP_incubator_10xSp_4d_Ch-GFP_G-ch-bio_SA635_1_Stitch"
   image_list_path: null
