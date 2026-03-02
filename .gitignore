@@ -9,7 +9,7 @@ __pycache__/
 *.tif
 *.pth
 *.png
-
+.vscode/
 
 
 # C extensions
