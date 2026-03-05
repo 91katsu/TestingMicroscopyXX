@@ -148,10 +148,10 @@ class ImageLoader:
     def load(self):
         image_path = self.cfg['root_path'] + self.cfg['image_path'][0]
         print(f"Loading: {image_path}")
-        img = tiff.imread(image_path) # (Z, Y, X)
+        img = tiff.imread(image_path) # (Z, Y, X) # (237, 2763, 2756)
         self.img = self.normalizer.forward_normalization(
             img, self.cfg['norm_method'][0], self.cfg['trd'][0]
-        )
+        ) # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
         return self.img
 
     def apply_percentile_norm(self):
@@ -171,29 +171,28 @@ class ImageLoader:
             self.img = (self.img - xmin) / (xmax - xmin)
             self.img = self.img * 2 - 1
 
-        return self.img
+        return self.img # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
 
-    def pad(self, patch_shape, crop_margin=None):
+    def pad(self, crop_margin=None):
         """
         Pad image for patch-based inference.
 
         Args:
-            patch_shape: (dz, dy, dx) patch dimensions
             crop_margin: (Cz, Cy, Cx) pixels cropped from each side during assembly.
                          If provided, pads by C on both sides to preserve original size.
         """
         if self.img is None:
             raise ValueError("Image not loaded. Call load() first.")
 
-        _, _, Dz, Dy, Dx = self.img.shape
+        _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
 
         print(f"Padding image from {self.img.shape}")
 
         # First, pad by crop margin (C) on both sides to preserve original size after assembly
         if crop_margin is not None:
             Cz, Cy, Cx = crop_margin
-            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz, Cz), mode='constant', value=self.img.min())
-            _, _, Dz, Dy, Dx = self.img.shape
+            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//self.cfg['z_scale_ratio'] , Cz//self.cfg['z_scale_ratio']), mode='constant', value=self.img.min())
+            _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X) # (1, 1, 245, 2795, 2788)
             print(f"After C padding: {self.img.shape}")
 
         zstep = int(eval(self.cfg['assemble_params']['zrange'][-1]))
@@ -206,9 +205,9 @@ class ImageLoader:
 
         Pz, Py, Px = Nz - Dz, Ny - Dy, Nx - Dx
         self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.min())
-        print(f"Final padded shape: {self.img.shape}")
+        print(f"After stride padding: {self.img.shape}")
 
-        return self.img
+        return self.img # (1, 1, Z, Y, X) # (1, 1, 260, 2912, 2912)
 
 
 # =============================================================================
@@ -226,8 +225,9 @@ class PatchProcessor:
 
     def run(self, x0_list, startIdx_zyx, patchShape_zyx, ii=None):
         # Extract and upsample patch
-        # 1, 1, z, y, x
+        # (B, C, Z, Y, X) # (1, 1, 64, 256, 256)
         patch = [x[:, :, startIdx_zyx[0]:startIdx_zyx[0]+patchShape_zyx[0], startIdx_zyx[1]:startIdx_zyx[1]+patchShape_zyx[1], startIdx_zyx[2]:startIdx_zyx[2]+patchShape_zyx[2]] for x in x0_list]
+        # (Z, C, Y, X) # (64, 1, 256, 256)
         patch = torch.cat([self.upsample(x).squeeze().unsqueeze(1) for x in patch], 1)
 
         if self.fp16 and self.gpu:
@@ -235,23 +235,27 @@ class PatchProcessor:
             with torch.cuda.amp.autocast():
                 _, Xup, outall, _ = self.model_proc.get_model_result(patch, self.augmentations, ii=ii)
         else:
+            # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
+            # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
             _, Xup, outall, _ = self.model_proc.get_model_result(patch, self.augmentations, ii=ii)
 
-        outall = outall.numpy().astype(np.float32)
-        Xup = Xup.numpy().astype(np.float32)
+        outall = outall.numpy().astype(np.float32) # (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
+        Xup = Xup.numpy().astype(np.float32) # (Z, C, Y, X) # (256, 1, 256, 256)
 
         # Match output range to input range per channel
         for c in range(outall.shape[1]):
             omin, omax = outall[:, c, :, :, :].min(), outall[:, c, :, :, :].max()
             xmin, xmax = Xup[:, c, :, :].min(), Xup[:, c, :, :].max()
             outall[:, c, :, :, :] = (outall[:, c, :, :, :] - omin) / (omax - omin + 1e-6) * (xmax - xmin) + xmin
-        return outall, Xup
+        # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
+        # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
+        return outall, Xup 
 
 
 # =============================================================================
-# ColumnAssembler
+# PatchAssembler
 # =============================================================================
-class ColumnAssembler:
+class PatchAssembler:
 
     def __init__(self, cfg, dest, target_name, output_format, output_datatype,
                  zrange, xrange, yrange, output_channel):
@@ -317,8 +321,8 @@ class ColumnAssembler:
             is_outall: True if data has augmentation dimension to average
         """
         if is_outall:
-            data = data.mean(axis=-1)  # average augmentations -> (Z, C, Y, X)
-        patch = np.transpose(data, (1, 0, 2, 3)).astype(np.float32)  # -> (C, Z, Y, X)
+            data = data.mean(axis=-1)  # average augmentations => (Z, C, Y, X, aug) -> (Z, C, Y, X)
+        patch = np.transpose(data, (1, 0, 2, 3)).astype(np.float32)  # (C, Z, Y, X)
         self.patches[(nz, ny)] = patch
 
     def _convert_dtype(self, data):
@@ -383,13 +387,13 @@ class ColumnAssembler:
                 ny_flag = -1 if ny == ny_count - 1 else ny
 
                 # Get patch and crop margins from all sides
-                patch = self.patches[(nz, ny)]  # (C, Z, X, Y)
-                cropped = patch[:, Cz:-Cz, Cy:-Cy, Cx:-Cx]
+                patch = self.patches[(nz, ny)]  # (C, Z, X, Y) # (1, 256, 256, 256)
+                cropped = patch[:, Cz:-Cz, Cy:-Cy, Cx:-Cx] # (C, Z, X, Y) # (1, 224, 224, 224)
 
                 w = self.create_tapered_weight(Sz, Sy, Sx, nz_flag, ny_flag, nx_flag,
                                           size=self.weight_shape)
                 w = np.stack([w] * cropped.shape[0], axis=0)
-                cropped = np.multiply(cropped, w)
+                cropped = np.multiply(cropped, w) # (C, Z, X, Y) # (1, 224, 224, 224)
 
                 # Y-axis blending: overlap Sy along axis 2
                 if len(one_column) > 0:
@@ -452,7 +456,7 @@ class ColumnAssembler:
 # InferencePipeline
 # =============================================================================
 class InferencePipeline:
-    """Orchestrates the full inference + assembly pipeline."""
+    """patch inference + assembly pipeline."""
 
     def __init__(self, args):
         self.args = args
@@ -508,8 +512,8 @@ class InferencePipeline:
 
     def run(self):
         # Load and preprocess image
-        self.image_loader.load()
-        self.image_loader.apply_percentile_norm()
+        self.image_loader.load() # (B, C, Z, Y, X) # (1, 1, 237, 2763, 2756)
+        self.image_loader.apply_percentile_norm() # (B, C, Z, Y, X) # (1, 1, 237, 2763, 2756)
         patch_shape = self.config['assemble_params']['dx_shape']
         dz, dy, dx = patch_shape
 
@@ -518,7 +522,7 @@ class InferencePipeline:
         if self.config.cfg['assemble_params'].get('testwhole', True):
             crop_margin = self.config['assemble_params']['C']
 
-        self.image_loader.pad(patch_shape, crop_margin=crop_margin)
+        self.image_loader.pad(crop_margin=crop_margin) # (B, C, Z, Y, X) # (1, 1, 260, 2912, 2912)
         x0 = [self.image_loader.img]
 
         # Get patch grid
@@ -529,7 +533,7 @@ class InferencePipeline:
         # Create one assembler per save target
         assemblers = {}
         for target in self.args.save:
-            assemblers[target] = ColumnAssembler(
+            assemblers[target] = PatchAssembler(
                 cfg=self.config.cfg,
                 dest=self.dest,
                 target_name=target,
@@ -548,14 +552,16 @@ class InferencePipeline:
                 # Infer all patches for this X-column
                 for nz, iz in enumerate(zrange):
                     for ny, iy in enumerate(yrange):
-                        out_all, Xup = self.processor.run(
+                        outall, Xup = self.processor.run(
                             x0,
                             startIdx_zyx=[iz, iy, ix],
                             patchShape_zyx=[dz, dy, dx],
                             ii=(iz, iy, ix)
                         )
+                        # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
+                        # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
                         if 'xy' in assemblers:
-                            assemblers['xy'].store_patch(nz, ny, out_all, is_outall=True)
+                            assemblers['xy'].store_patch(nz, ny, outall, is_outall=True)
                         if 'ori' in assemblers:
                             assemblers['ori'].store_patch(nz, ny, Xup, is_outall=False)
                         pbar.update(1)

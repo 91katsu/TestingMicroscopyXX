@@ -10,7 +10,8 @@ __pycache__/
 *.pth
 *.png
 .vscode/
-
+docs/
+screenshots/
 
 # C extensions
 *.so

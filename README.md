@@ -15,32 +15,6 @@ This project performs inference and reconstruction on 3D microscopy images using
 - **FP16 Precision**: Efficient mixed-precision inference
 - **Seamless Assembly**: Tapered weighting for smooth patch stitching
 
-## Project Structure
-
-```
-TestingMicroscopyXX/
-├── test_only.py           # Main inference script
-├── test_assemble.py       # Volume assembly script
-├── run.sh                 # Execution examples
-├── requirements.txt       # Dependencies
-├── models/                # Model definitions
-│   ├── base.py            # Base classes, VGG losses
-│   ├── ae0iso0tc.py       # AutoEncoder model
-│   └── CUT.py             # Contrastive Unpaired Translation
-├── networks/              # Neural network architectures
-│   ├── EncoderDecoder/    # 17 encoder-decoder variants
-│   ├── resunet/           # ResUNet architectures
-│   ├── DeScarGan/         # GAN components
-│   └── cyclegan/          # CycleGAN implementations
-├── utils/                 # Utility modules
-│   ├── model_utils.py     # ModelProcesser class
-│   ├── data_utils.py      # DataNormalization class
-│   └── raw_to_patches.py  # Patch extraction
-├── ldm/                   # Latent Diffusion Model components
-├── taming/                # VQGAN/taming modules
-└── test/                  # YAML configuration files
-```
-
 ## Supported Microscopy Modalities
 
 - Structured Illumination Microscopy (SIM)
@@ -49,6 +23,24 @@ TestingMicroscopyXX/
 - Expansion microscopy (iUExM)
 - Blood vessel imaging
 - Organoid imaging
+
+## Project Structure
+
+```
+TestingMicroscopyXX/
+├── test.py                # Main inference script
+├── run.sh                 # Execution examples
+├── requirements.txt       # Dependencies
+├── models/                # Model definitions
+│   ├── base.py            # Base classes, VGG losses
+│   ├── ae0iso0tc.py       # AutoEncoder model
+│   └── CUT.py             # Contrastive Unpaired Translation
+├── networks/              # Neural network architectures
+├── utils/                 # Utility modules
+├── ldm/                   # Latent Diffusion Model components
+├── taming/                # VQGAN/taming modules
+└── test/                  # YAML configuration files
+```
 
 ## Installation
 
@@ -65,78 +57,97 @@ pip install -r requirements.txt
 
 ## Usage
 
-### 1. Inference
-
-Run model inference on a 3D microscopy volume:
+Run inference and assembly in one step:
 
 ```bash
-python test_only.py --gpu --config ConfigName --save ori xy \
-    --augmentation encode --testcube --option MODELOPTION
+# Output as TIFF (default)
+python test.py --gpu --config filopodiaX4 --option ENC
+# Output as Zarr
+python test.py --gpu --config filopodiaX4 --option ENC --output_format zarr
+# Only want to output xy tiff
+python test.py --gpu --config filopodiaX4 --option ENC --save xy
 ```
 
 **Arguments:**
-- `--gpu`: Use GPU acceleration
-- `--config`: Configuration file name (from `test/` directory)
-- `--save`: Output types to save
-- `--augmentation`: Augmentation strategy (encode/decode)
-- `--testcube`: Enable test cube mode
-- `--option`: Model-specific options
 
-### 2. Volume Assembly
-
-Assemble patches into complete 3D volumes:
-
-```bash
-python test_assemble.py --config ConfigName --targets xy --option MODELOPTION
-```
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--config` | Config file name in `test/` (without `.yaml`) | required |
+| `--option` | Model section in config (e.g. `ENC`) | required |
+| `--gpu` | Use GPU acceleration | off |
+| `--fp16` | Use FP16 mixed-precision inference | off |
+| `--augmentation` | Augmentation stage: `encode` or `decode` | `encode` |
+| `--save` | Targets to save: `ori` (upsampled input), `xy` (enhanced result) | `ori xy` |
+| `--output_format` | `tiff` (per-slice) or `zarr` (5D volume) | `tiff` |
+| `--output_datatype` | `float32`, `uint8`, or `uint16` | `float32` |
 
 ## Configuration
 
-Configurations are YAML files in the `test/` directory. Key parameters:
+YAML config files in `test/` have two sections: `DEFAULT` (shared parameters) and a model section (e.g. `ENC`):
 
 ```yaml
-image_path: /path/to/input.tif
-checkpoint: /path/to/model/checkpoints
-epoch: 100
-patch_size: [32, 256, 256]
-stride: [16, 128, 128]
-normalization: '01'
+DEFAULT:
+  SOURCE: '/path/to/models/'              # model storage root path
+  root_path: '/path/to/input/data/'       # input data root path
+  DESTINATION: '/path/to/output/'         # output root path
+  upsample_params:                        # trilinear upsample target size
+    size: [32, 256, 256]                  # same with dx_shape if no upsample
+  assemble_params:
+    C: [16, 16, 16]                       # crop margin per side (pixels)
+    S: [16, 16, 16]                       # overlap for tapered blending
+    dx_shape: [32, 256, 256]              # inference patch size (Z, Y, X)
+    # 8X SR -> dx_shape = [256/8, 256, 256] = [32, 256, 256]
+    # 4X SR -> dx_shape = [256/4, 256, 256] = [64, 256, 256]
+    # 2X SR -> dx_shape = [256/2, 256, 256] = [128, 256, 256]
+    weight_shape: [224, 224, 224]         # dx_shape - C * 2
+    weight_method: "cross"                # currently only one method available, no need to change 
+    testwhole: True                       # process entire volume
+    # If testwhole = False, the default ROI size for testing is (256, 1024, 1024)
+    zrange: [0, 256 - 13 * 2, 13 * 2]     # [start, end, step]
+    xrange: [0, 1024 - 13 * 16, 13 * 16]
+    yrange: [0, 1024 - 13 * 16, 13 * 16]
+    # If testwhole = True, only the step value matters (start and end are auto-calculated from image size)
+    # 8X SR -> zrange = [0, 256 - 13 * 16/8, 13 * 16/8]
+    #          yrange = [0, 1024 - 13 * 16, 13 * 16]
+    #          xrange = [0, 1024 - 13 * 16, 13 * 16]
+    # 4X SR -> zrange = [0, 256 - 13 * 16/4, 13 * 16/4]
+    #          yrange = [0, 1024 - 13 * 16, 13 * 16]
+    #          xrange = [0, 1024 - 13 * 16, 13 * 16]
+    # 2X SR -> zrange = [0, 256 - 13 * 16/2, 13 * 16/2]
+    #          yrange = [0, 1024 - 13 * 16, 13 * 16]
+    #          xrange = [0, 1024 - 13 * 16, 13 * 16]
+  mc: 1                                   # Monte Carlo passes
+  input_augmentation: [null, 'transpose'] # test-time augmentations
+  output_channel: 1
+  z_scale_ratio: 8                        # Z-axis scale factor
+  # 8X SR -> z_scale_ratio = 8
+  # 4X SR -> z_scale_ratio = 4
+  # 2X SR -> z_scale_ratio = 2
+
+ENC:
+  dataset: "filopodia"                    # {DESTINATION}/{dataset} = full output path
+  image_list_path: null                   # not currently used, no need to change
+  image_path: ["input.tif"]               # {root_path}/{image_path[0]} = input image full path
+  prj: "project/experiment/"              # {SOURCE}/logs/{prj} = model checkpoint full path
+  epoch: 500                              # checkpoint epoch
+  model_type: "VQQ2"                      # AE / GAN / VQQ2
+  hbranchz: true
+  downbranch: 2                           # 1 for 8X SR, 2 for 4X SR, 4 for 2X SR
+  checking_codebook: true
+  decode_augmentation: false
+  norm_method: ["11", "00"]               # '00'=as-is, '01'=0-1, '11'=-1~1
+  trd: [[ None, None]]
+  norm_mean_std: null
+  norm_percentile: [0.1, 99.9]            # percentile clipping range
 ```
 
 ## Workflow
 
-1. **Configure**: Select/create a YAML config file
-2. **Inference**: Run `test_only.py` to process patches
-3. **Assemble**: Run `test_assemble.py` to combine patches
-4. **Output**: Reconstructed 3D TIFF volumes
+1. **Configure**: Create or select a YAML config file in `test/`
+2. **Run Inference**: Execute `test.py` to inference and assembly in one step
+3. **Output**: Reconstructed 3D volumes (TIFF or Zarr)
+    - Supports uint8, uint16, float32 formats
+    - Save targets: `ori` (upsampled input), `xy`(model-enhanced result)
+    - Output formats: TIFF (per-slice) or Zarr (5D volume)
+    - Default viewing plane is YZ (TIFF saves one YZ slice per X position; Zarr stores X as the primary axis for the same view)
 
-## Core Components
-
-### ModelProcesser (`utils/model_utils.py`)
-
-Handles model loading and inference:
-- Loads AE/GAN/VQQ2 checkpoints
-- Manages encoder/decoder processing
-- Supports test-time augmentation
-
-### DataNormalization (`utils/data_utils.py`)
-
-Handles image normalization:
-- Multiple methods: '00', '01', '11'
-- Percentile-based clipping
-- Forward/backward transforms
-
-## Output
-
-- Reconstructed 3D volumes in TIFF format
-- Multiple output channels (xy, xz, etc.)
-- Optional uncertainty maps (standard deviation)
-- Supports uint8, uint16, float32 formats
-
-## License
-
-[Add license information]
-
-## Citation
-
-[Add citation information if applicable]
