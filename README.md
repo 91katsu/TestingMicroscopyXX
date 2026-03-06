@@ -87,9 +87,9 @@ YAML config files in `test/` have two sections: `DEFAULT` (shared parameters) an
 
 ```yaml
 DEFAULT:
-  SOURCE: '/path/to/models/'              # model storage root path
-  root_path: '/path/to/input/data/'       # input data root path
-  DESTINATION: '/path/to/output/'         # output root path
+  SOURCE: '/path/to/models/'              # {SOURCE}/logs/{prj} = full model checkpoint path
+  root_path: '/path/to/input/data/'       # {root_path}/{image_path[0]} = full input image path
+  DESTINATION: '/path/to/output/'         # {DESTINATION}/{dataset} = full output path
   upsample_params:                        # trilinear upsample target size
     size: [32, 256, 256]                  # same with dx_shape if no upsample
   assemble_params:
@@ -127,15 +127,15 @@ DEFAULT:
 ENC:
   dataset: "filopodia"                    # {DESTINATION}/{dataset} = full output path
   image_list_path: null                   # not currently used, no need to change
-  image_path: ["input.tif"]               # {root_path}/{image_path[0]} = input image full path
-  prj: "project/experiment/"              # {SOURCE}/logs/{prj} = model checkpoint full path
+  image_path: ["input.tif"]               # {root_path}/{image_path[0]} = full input image path
+  prj: "project/experiment/"              # {SOURCE}/logs/{prj} = full model checkpoint path
   epoch: 500                              # checkpoint epoch
   model_type: "VQQ2"                      # AE / GAN / VQQ2
   hbranchz: true                          # use encoder posterior as h-branch input (VQQ2 only)
   downbranch: 1                           # 1 for 8X SR, 2 for 4X SR, 4 for 2X SR
   checking_codebook: true                 # log VQ codebook usage during inference (VQQ2 only)
   decode_augmentation: false              # apply additional augmentations during decoding
-  norm_method: ["11", "00"]               # '00'=as-is, '01'=0-1, '11'=-1~1
+  norm_method: ["11"]                     # '00'=as-is, '01'=0-1, '11'=-1~1
   trd: [[ None, None]]                    # intensity clipping thresholds [lower, upper] before normalization. [None, None] = no clipping
   norm_mean_std: null                     # not currently used
   norm_percentile: [0.1, 99.9]            # percentile clipping range applied after normalization
@@ -144,12 +144,22 @@ ENC:
 ## Workflow
 
 1. **Configure**: Create or select a YAML config file in `test/`
-2. **Run Inference**: Execute `test.py` to inference and assembly in one step
+2. **Run Inference**: Execute `run.sh` to inference and assembly in one step
 3. **Output**: Reconstructed 3D volumes (TIFF or Zarr)
     - Supports uint8, uint16, float32 formats
     - Save targets: `ori` (upsampled input), `xy`(model-enhanced result)
     - Output formats: TIFF (per-slice) or Zarr (5D volume)
     - Default viewing plane is YZ (TIFF saves one YZ slice per X position; Zarr stores X as the primary axis for the same view)
+    
+### Patch Grid Calculation
+
+The model takes input patches of size `(Z, Y, X) = (256/z_scale_ratio, 256, 256)` and outputs `(256, 256, 256)`. To avoid boundary artifacts, each output patch is cropped by `C` pixels on each side before assembly, resulting in a `(224, 224, 224)` cube. Each cropped patch is then multiplied by a tapered weight that decays toward the edges. Adjacent patches overlap by `S` pixels and are summed in the overlap region for seamless blending. 
+
+The figure below illustrates how the crop size `C` and overlap `S` determine the step size:
+
+![Patch Grid Calculation](assets/TestMicroscopyXX_Patch_Grid_Calculation.png)
+
+**Note:** The step size of `zrange` depends on the Z upscaling factor. If the Z dimension is upscaled by `k×`, the `zrange` step size becomes `1/k` times the `xrange` and `yrange` step size.
 
 ## Viewing Zarr Output
 
