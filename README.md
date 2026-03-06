@@ -151,7 +151,7 @@ ENC:
     - Output formats: TIFF (per-slice) or Zarr (5D volume)
     - Default viewing plane is YZ (TIFF saves one YZ slice per X position; Zarr stores X as the primary axis for the same view)
 
-### Viewing Zarr Output
+## Viewing Zarr Output
 
 To view Zarr results in a web viewer (e.g. [Avivator](https://avivator.gehlenborglab.org/)), start a local HTTP server from the Zarr root directory:
 
