@@ -118,7 +118,7 @@ DEFAULT:
     #          xrange = [0, 1024 - 13 * 16, 13 * 16]
   mc: 1                                   # Monte Carlo passes
   input_augmentation: [null, 'transpose'] # test-time augmentations
-  output_channel: 1
+  output_channel: 1                       # number of output channels in the assembled volume
   z_scale_ratio: 8                        # Z-axis scale factor
   # 8X SR -> z_scale_ratio = 8
   # 4X SR -> z_scale_ratio = 4
@@ -131,14 +131,14 @@ ENC:
   prj: "project/experiment/"              # {SOURCE}/logs/{prj} = model checkpoint full path
   epoch: 500                              # checkpoint epoch
   model_type: "VQQ2"                      # AE / GAN / VQQ2
-  hbranchz: true
-  downbranch: 2                           # 1 for 8X SR, 2 for 4X SR, 4 for 2X SR
-  checking_codebook: true
-  decode_augmentation: false
+  hbranchz: true                          # use encoder posterior as h-branch input (VQQ2 only)
+  downbranch: 1                           # 1 for 8X SR, 2 for 4X SR, 4 for 2X SR
+  checking_codebook: true                 # log VQ codebook usage during inference (VQQ2 only)
+  decode_augmentation: false              # apply additional augmentations during decoding
   norm_method: ["11", "00"]               # '00'=as-is, '01'=0-1, '11'=-1~1
-  trd: [[ None, None]]
-  norm_mean_std: null
-  norm_percentile: [0.1, 99.9]            # percentile clipping range
+  trd: [[ None, None]]                    # intensity clipping thresholds [lower, upper] before normalization. [None, None] = no clipping
+  norm_mean_std: null                     # not currently used
+  norm_percentile: [0.1, 99.9]            # percentile clipping range applied after normalization
 ```
 
 ## Workflow
@@ -150,4 +150,16 @@ ENC:
     - Save targets: `ori` (upsampled input), `xy`(model-enhanced result)
     - Output formats: TIFF (per-slice) or Zarr (5D volume)
     - Default viewing plane is YZ (TIFF saves one YZ slice per X position; Zarr stores X as the primary axis for the same view)
+
+### Viewing Zarr Output
+
+To view Zarr results in a web viewer (e.g. [Avivator](https://avivator.gehlenborglab.org/)), start a local HTTP server from the Zarr root directory:
+
+```bash
+# If the Zarr path is result/xxx.zarr:
+cd result
+npx http-server -p 8001 --cors='*'
+```
+
+Then open the Zarr data in Avivator using the URL: `http://localhost:8001/xxx.zarr`
 
