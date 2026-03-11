@@ -8,6 +8,7 @@ import tifffile as tiff
 import yaml
 import zarr
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils.model_utils import read_json_to_args, import_model, load_pth, ModelProcesser
 from utils.data_utils import DataNormalization
@@ -54,10 +55,13 @@ class VQQModel:
         self.quant_conv = torch.load(f"{ckpt}quant_conv_model_epoch_{epoch}.pth", map_location='cpu', weights_only=False)
         self.post_quant_conv = torch.load(f"{ckpt}post_quant_conv_model_epoch_{epoch}.pth", map_location='cpu', weights_only=False)
 
-    def cuda(self):
+    def to(self, device):
         for attr in ['encoder', 'decoder', 'net_g', 'quantize', 'quant_conv', 'post_quant_conv']:
-            setattr(self, attr, getattr(self, attr).cuda())
+            setattr(self, attr, getattr(self, attr).to(device))
         return self
+
+    def cuda(self):
+        return self.to('cuda')
 
     def half(self):
         for attr in ['encoder', 'decoder', 'net_g', 'quantize', 'quant_conv', 'post_quant_conv']:
@@ -73,24 +77,26 @@ class VQQModel:
 class ModelLoader:
     """Handles model loading for different model types."""
 
-    def __init__(self, cfg, gpu=False, fp16=False, augmentation='encode'):
+    def __init__(self, cfg, device='cpu', fp16=False, augmentation='encode'):
         self.cfg = cfg
-        self.gpu = gpu
+        self.device = torch.device(device)
+        self.gpu = (self.device.type == 'cuda')
         self.fp16 = fp16
         self.augmentation = augmentation
 
         self.model = self._load_model()
         self.upsample = torch.nn.Upsample(size=cfg['upsample_params']['size'], mode='trilinear')
 
-        if gpu:
-            self.upsample = self.upsample.cuda()
+        if self.gpu:
+            self.upsample = self.upsample.to(self.device)
 
         self.model_proc = ModelProcesser(
             cfg.cfg if isinstance(cfg, Config) else cfg,
             self.model,
-            gpu=gpu,
+            gpu=self.gpu,
             augmentation=augmentation,
-            fp16=fp16
+            fp16=fp16,
+            device=self.device
         )
 
     def _load_model(self):
@@ -109,7 +115,7 @@ class ModelLoader:
             raise ValueError(f"Unknown model_type: {model_type}")
 
         if self.gpu:
-            model = model.cuda()
+            model = model.to(self.device) if hasattr(model, 'to') else model
         for p in model.parameters():
             p.requires_grad = False
         if self.fp16:
@@ -216,17 +222,21 @@ class ImageLoader:
 class PatchProcessor:
     """Handles inference on patches."""
 
-    def __init__(self, model_proc, upsample, augmentations, fp16=False, gpu=False):
+    def __init__(self, model_proc, upsample, augmentations, fp16=False, gpu=False, device='cpu'):
         self.model_proc = model_proc
         self.upsample = upsample
         self.augmentations = augmentations
         self.fp16 = fp16
         self.gpu = gpu
+        self.device = torch.device(device)
 
     def run(self, x0_list, startIdx_zyx, patchShape_zyx, ii=None):
         # Extract and upsample patch
+        # x0_list is on CPU, slice then move to this worker's device
         # (B, C, Z, Y, X) # (1, 1, 64, 256, 256)
         patch = [x[:, :, startIdx_zyx[0]:startIdx_zyx[0]+patchShape_zyx[0], startIdx_zyx[1]:startIdx_zyx[1]+patchShape_zyx[1], startIdx_zyx[2]:startIdx_zyx[2]+patchShape_zyx[2]] for x in x0_list]
+        # Move to this worker's device for upsample
+        patch = [x.to(self.device) for x in patch]
         # (Z, C, Y, X) # (64, 1, 256, 256)
         patch = torch.cat([self.upsample(x).squeeze().unsqueeze(1) for x in patch], 1)
 
@@ -249,7 +259,7 @@ class PatchProcessor:
             outall[:, c, :, :, :] = (outall[:, c, :, :, :] - omin) / (omax - omin + 1e-6) * (xmax - xmin) + xmin
         # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
         # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
-        return outall, Xup 
+        return outall, Xup
 
 
 # =============================================================================
@@ -363,14 +373,20 @@ class PatchAssembler:
 
         return weight
 
-    def assemble_column(self, nx):
+    def assemble_column(self, nx, patches=None):
         """Assemble all patches for X-column index nx and write output.
+
+        Args:
+            nx: X-column index.
+            patches: dict of {(nz, ny): patch_array}. If None, uses self.patches.
 
         Uses zarr version's axis convention:
         - Inner loop (ny): blend along Y (axis 3 of CZXY)
         - Middle loop (nz): blend along Z (axis 2 after transpose to CXZY)
         - Outer (nx): blend along X (axis 1) via last_block
         """
+        if patches is None:
+            patches = self.patches
         Cz, Cy, Cx = self.Cz, self.Cy, self.Cx
         Sz, Sy, Sx = self.Sz, self.Sy, self.Sx
         nz_count = len(self.zrange)
@@ -387,7 +403,7 @@ class PatchAssembler:
                 ny_flag = -1 if ny == ny_count - 1 else ny
 
                 # Get patch and crop margins from all sides
-                patch = self.patches[(nz, ny)]  # (C, Z, X, Y) # (1, 256, 256, 256)
+                patch = patches[(nz, ny)]  # (C, Z, X, Y) # (1, 256, 256, 256)
                 cropped = patch[:, Cz:-Cz, Cy:-Cy, Cx:-Cx] # (C, Z, X, Y) # (1, 224, 224, 224)
 
                 w = self.create_tapered_weight(Sz, Sy, Sx, nz_flag, ny_flag, nx_flag,
@@ -429,9 +445,6 @@ class PatchAssembler:
         self.last_block = one_zy_block[:, -Sx:, :, :].copy()
         self.current_x_position += one_zy_block.shape[1] - Sx
 
-        # Free memory
-        self.patches.clear()
-
     def _write_column_tiff(self, one_zy_block, Sx):
         """Write assembled column as per-X-position TIFF slices."""
         for x in range(0, one_zy_block.shape[1] - Sx):
@@ -466,25 +479,40 @@ class InferencePipeline:
         self.dest = os.path.join(self.config['DESTINATION'], self.config['dataset'])
         self._setup_output_dirs()
 
-        # Initialize components
-        print("Loading model...")
-        self.model_loader = ModelLoader(
-            self.config,
-            gpu=args.gpu,
-            fp16=args.fp16,
-            augmentation=args.augmentation
-        )
+        # Determine devices
+        if args.gpu:
+            self.num_gpus = torch.cuda.device_count()
+            if self.num_gpus == 0:
+                raise RuntimeError("--gpu specified but no CUDA devices found")
+            self.devices = [f'cuda:{i}' for i in range(self.num_gpus)]
+        else:
+            self.num_gpus = 1
+            self.devices = ['cpu']
+
+        print(f"Using {self.num_gpus} device(s): {self.devices}")
+
+        # Build one model + processor per device
+        self.workers = []
+        for device in self.devices:
+            print(f"Loading model on {device}...")
+            loader = ModelLoader(
+                self.config,
+                device=device,
+                fp16=args.fp16,
+                augmentation=args.augmentation
+            )
+            proc = PatchProcessor(
+                loader.model_proc,
+                loader.upsample,
+                self.config.get('input_augmentation', [None]),
+                fp16=args.fp16,
+                gpu=(device != 'cpu'),
+                device=device
+            )
+            self.workers.append(proc)
 
         print("Loading image...")
         self.image_loader = ImageLoader(self.config)
-
-        self.processor = PatchProcessor(
-            self.model_loader.model_proc,
-            self.model_loader.upsample,
-            self.config.get('input_augmentation', [None]),
-            fp16=args.fp16,
-            gpu=args.gpu
-        )
 
     def _setup_output_dirs(self):
         os.makedirs(self.dest, exist_ok=True)
@@ -547,28 +575,66 @@ class InferencePipeline:
         print('zrange:', zrange)
         print('yrange:', yrange)
 
+        # Build list of (nz, ny, iz, iy) for each x-column
+        column_patches = []
+        for nz, iz in enumerate(zrange):
+            for ny, iy in enumerate(yrange):
+                column_patches.append((nz, ny, iz, iy))
+
+        num_workers = len(self.workers)
+        # Use a persistent thread pool + a separate thread for assembly
+        assemble_executor = ThreadPoolExecutor(max_workers=1)
+        assemble_future = None
+
         with tqdm(total=total_patches, desc="Processing") as pbar:
-            for nx, ix in enumerate(xrange):
-                # Infer all patches for this X-column
-                for nz, iz in enumerate(zrange):
-                    for ny, iy in enumerate(yrange):
-                        outall, Xup = self.processor.run(
+            with ThreadPoolExecutor(max_workers=num_workers) as infer_executor:
+                for nx, ix in enumerate(xrange):
+                    futures = {}
+                    for idx, (nz, ny, iz, iy) in enumerate(column_patches):
+                        gpu_id = idx % num_workers
+                        fut = infer_executor.submit(
+                            self.workers[gpu_id].run,
                             x0,
                             startIdx_zyx=[iz, iy, ix],
                             patchShape_zyx=[dz, dy, dx],
                             ii=(iz, iy, ix)
                         )
-                        # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
+                        futures[fut] = (nz, ny)
+
+                    # Collect results (order doesn't matter for store_patch)
+                    for fut in as_completed(futures):
+                        nz, ny = futures[fut]
+                        outall, Xup = fut.result()
                         # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
+                        # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
                         if 'xy' in assemblers:
                             assemblers['xy'].store_patch(nz, ny, outall, is_outall=True)
                         if 'ori' in assemblers:
                             assemblers['ori'].store_patch(nz, ny, Xup, is_outall=False)
                         pbar.update(1)
 
-                # Assemble the completed X-column immediately
-                for asm in assemblers.values():
-                    asm.assemble_column(nx)
+                    # Snapshot patches and reset — so next column can store immediately
+                    patches_snapshots = {}
+                    for target, asm in assemblers.items():
+                        patches_snapshots[target] = asm.patches
+                        asm.patches = {}  # fresh dict for next column
+
+                    # Wait for previous assembly (it uses last_block for X-blending)
+                    if assemble_future is not None:
+                        assemble_future.result()
+
+                    # Launch assembly in background with snapshot
+                    def _assemble(assemblers, snapshots, nx):
+                        for target, asm in assemblers.items():
+                            asm.assemble_column(nx, patches=snapshots[target])
+                    assemble_future = assemble_executor.submit(
+                        _assemble, assemblers, patches_snapshots, nx
+                    )
+
+        # Wait for the last column's assembly
+        if assemble_future is not None:
+            assemble_future.result()
+        assemble_executor.shutdown(wait=True)
 
         if self.args.output_format == 'tiff':
             for target, asm in assemblers.items():

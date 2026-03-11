@@ -46,7 +46,7 @@ def read_json_to_args(json_file):
 
 
 class ModelProcesser:
-    def __init__(self, kwargs, model, gpu=True, augmentation='decode', fp16=False):
+    def __init__(self, kwargs, model, gpu=True, augmentation='decode', fp16=False, device='cuda:0'):
         """
           A class that handles processing and augmentation of super-resolution model,
           Attributes:
@@ -61,6 +61,7 @@ class ModelProcesser:
         self.gpu = gpu
         self.augmentation = augmentation
         self.fp16 = fp16
+        self.device = torch.device(device)
 
     def get_model_result(self, x0, input_augmentation, ii=None):
         """
@@ -142,8 +143,7 @@ class ModelProcesser:
                tuple: (Xup, _, hbranch) - Upsampled input, unused value, and latent representation.
         """
         if self.gpu:
-            x0 = x0.cuda(non_blocking=True)
-            # x0 = x0.to('cuda:0', non_blocking=True)
+            x0 = x0.to(self.device, non_blocking=True)
         if self.augmentation == "encode":
             x0 = self._test_time_augementation(x0, method=method)
 
@@ -173,7 +173,7 @@ class ModelProcesser:
                Tensor: XupX - Decoded and potentially augmented output.
         """
         if self.gpu:
-            hbranch = hbranch.cuda()
+            hbranch = hbranch.to(self.device)
         if self.augmentation == "decode":
             hbranch = self._test_time_augementation(hbranch, method=method)
         if self.kwargs['hbranchz']:
@@ -190,10 +190,10 @@ class ModelProcesser:
             #print(hbranch.shape, hb2.shape)
             #hbranch = torch.stack([hbranch, hb2], dim=-1).max(dim=-1)[0]  # (Z, C, X, Y)
 
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(self.device)
         out = self.model.net_g(hbranch, method='decode')
         Xout = out['out0'].detach()#.to('cpu')  # (1, C, X, Y, Z) # , non_blocking=True, non_blocking=True
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(self.device)
 
         # (1, C, X, Y, Z)
         XupX = Xout[0, :].permute(3, 0, 1, 2)  # (Z, C, X, Y)
@@ -237,8 +237,8 @@ class ModelProcesser:
         import torch.nn.functional as F
         
         if self.gpu:
-            x0 = x0.cuda(non_blocking=True)
-        
+            x0 = x0.to(self.device, non_blocking=True)
+
         out_aug = []
         
         for i, aug in enumerate(method):  # (Z, C, X, Y)

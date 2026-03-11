@@ -57,15 +57,20 @@ pip install -r requirements.txt
 
 ## Usage
 
-Run inference and assembly in one step:
+Run inference and assembly in one step. By default, all available GPUs on the device are used for inference. To specify which GPUs to use, set `CUDA_VISIBLE_DEVICES` (e.g., `CUDA_VISIBLE_DEVICES=0,2` to use GPU 0 and 2):
 
 ```bash
-# Output as TIFF (default)
+# Output as TIFF (default, uses all available GPUs)
 python test.py --gpu --config filopodiaX4 --option ENC
+
+# Use specific GPUs
+# CUDA_VISIBLE_DEVICES=0,1 python test.py --gpu --config filopodiaX4 --option ENC
+
 # Output as Zarr
-python test.py --gpu --config filopodiaX4 --option ENC --output_format zarr
-# Only want to output xy tiff
-python test.py --gpu --config filopodiaX4 --option ENC --save xy
+# python test.py --gpu --config filopodiaX4 --option ENC --output_format zarr
+
+# Only want to output enhanced result
+# python test.py --gpu --config filopodiaX4 --option ENC --save xy
 ```
 
 **Arguments:**
