@@ -12,10 +12,11 @@ import time
 import tifffile as tiff
 
 
-def load_pth(gan, root, epoch, model_names):
+def load_pth(gan, root, epoch, model_names, version=''):
+    ver = version + '/' if version else ''
     for name in model_names:
-        setattr(gan, name, torch.load(os.path.join(root, f"checkpoints/{name}_model_epoch_{str(epoch)}.pth"),
-                                      map_location=torch.device('cpu')))
+        setattr(gan, name, torch.load(os.path.join(root, f"checkpoints/{ver}{name}_model_epoch_{str(epoch)}.pth"),
+                                      map_location=torch.device('cpu'), weights_only=False))
     return gan
 
 

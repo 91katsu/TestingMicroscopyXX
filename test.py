@@ -131,14 +131,15 @@ class ModelLoader:
         ckpt_root = os.path.join(cfg['MODEL'], cfg['checkpoint_path'])
         epoch = cfg['epoch']
         model_type = cfg['model_type']
+        version = cfg.get('version', '')
         print(f"Loading model from checkpoint, epoch: {epoch}, model type: {model_type}")
 
         if model_type == 'AE':
-            model = self._load_ae(ckpt_root, epoch)
+            model = self._load_ae(ckpt_root, epoch, version)
         elif model_type == 'GAN':
-            model = self._load_gan(ckpt_root, epoch)
+            model = self._load_gan(ckpt_root, epoch, version)
         elif model_type == 'VQQ2':
-            model = self._load_vqq2(ckpt_root, epoch)
+            model = self._load_vqq2(ckpt_root, epoch, version)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -151,20 +152,23 @@ class ModelLoader:
 
         return model
 
-    def _load_ae(self, ckpt_root, epoch):
+    def _load_ae(self, ckpt_root, epoch, version=''):
         args = read_json_to_args(os.path.join(ckpt_root, "0.json"))
         model_module = import_model(ckpt_root, model_name=args.models)
         model = model_module.GAN(args, train_loader=None, eval_loader=None, checkpoints=None)
         model = load_pth(model, root=ckpt_root, epoch=epoch,
-                         model_names=['encoder', 'decoder', 'net_g', 'post_quant_conv', 'quant_conv'])
+                         model_names=['encoder', 'decoder', 'net_g', 'post_quant_conv', 'quant_conv'],
+                         version=version)
         return model
 
-    def _load_gan(self, ckpt_root, epoch):
-        model_path = os.path.join(ckpt_root, f"checkpoints/net_g_model_epoch_{epoch}.pth")
-        return torch.load(model_path, map_location='cpu')
+    def _load_gan(self, ckpt_root, epoch, version=''):
+        ver = version + '/' if version else ''
+        model_path = os.path.join(ckpt_root, f"checkpoints/{ver}net_g_model_epoch_{epoch}.pth")
+        return torch.load(model_path, map_location='cpu', weights_only=False)
 
-    def _load_vqq2(self, ckpt_root, epoch):
-        ckpt = os.path.join(ckpt_root, "checkpoints")
+    def _load_vqq2(self, ckpt_root, epoch, version=''):
+        ver = version + '/' if version else ''
+        ckpt = os.path.join(ckpt_root, f"checkpoints/{ver}")
         return VQQModel(ckpt, epoch)
 
 
@@ -225,7 +229,7 @@ class ImageLoader:
         # First, pad by crop margin (C) on both sides to preserve original size after assembly
         if crop_margin is not None:
             Cz, Cy, Cx = crop_margin
-            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//self.cfg['z_scale_ratio'] , Cz//self.cfg['z_scale_ratio']), mode='constant', value=self.img.min())
+            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//self.cfg['z_scale_ratio'] , Cz//self.cfg['z_scale_ratio']), mode='constant', value=self.img.mean())
             _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X) # (1, 1, 245, 2795, 2788)
             print(f"After C padding: {self.img.shape}")
 
@@ -238,7 +242,7 @@ class ImageLoader:
         Nx = ((Dx // xstep) + 1) * xstep
 
         Pz, Py, Px = Nz - Dz, Ny - Dy, Nx - Dx
-        self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.min())
+        self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.mean())
         print(f"After stride padding: {self.img.shape}")
 
         return self.img # (1, 1, Z, Y, X) # (1, 1, 260, 2912, 2912)

@@ -30,6 +30,32 @@ notinuse/
 
 CLAUDE.md
 
+# Claude Code
+.claude/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+.env.local
+
+# Python tools / build
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info/
+*.egg
+
+# OS / editor
+Thumbs.db
+*.swp
+*.swo
+
 # Docker
 Dockerfile
 .dockerignore 

@@ -1,0 +1,49 @@
+DEFAULT:
+  z_scale_ratio: 4
+  testwhole: True
+  upsample_params:
+    size: [64, 256, 256]
+  assemble_params:
+    C: [16, 16, 16]
+    S: [16, 16, 16]
+    patch_shape: [64, 256, 256]
+    weight_shape: [224, 224, 224]
+    zrange: [0, 256 - 13 * 4, 13 * 4]
+    xrange: [0, 1024 - 13 * 16, 13 * 16]
+    yrange: [0, 1024 - 13 * 16, 13 * 16]
+
+  # image setting
+  norm_method: ["11", "11"]
+  trd: [[ None, None]] # trd: [[0, 65535]]
+  norm_percentile: [0.1, 99.9]
+
+  # model setting
+  model_type: "VQQ2"
+  epoch: 1000
+  hbranchz: true
+  downbranch: 2
+  checking_codebook: true
+  decode_augmentation: false
+  mc: 1
+  input_augmentation: [null, 'transpose']
+  output_channel: 1
+
+  # pipeline settings
+  fp16: false
+  augmentation: "encode"
+  save: ["ori", "xy"]
+  output_format: "tiff"
+  output_datatype: "float32"
+
+filopodia:
+  input_image_filename: "10X_G0431;6xGFP_incubator_10xSp_4d_Ch-GFP_G-ch-bio_SA635_9_R.tif"
+  output_dir_name: "filopodia_infer_20260316_075006_epoch"
+  checkpoint_path: "logs/filopodia/default/"
+  version: "20260316_075006"
+
+  # paths resolved via --env:
+  # checkpoint = SOURCE/checkpoint_path
+  # input      = DATASET/input_image_filename
+  # output     = RESULT/output_dir_name
+
+# python test.py --env GHCL01 --config filopodia_GHCL01 --option filopodia
