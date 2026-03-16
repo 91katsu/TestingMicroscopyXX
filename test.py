@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shutil
 import numpy as np
@@ -24,15 +25,41 @@ if not hasattr(q, "VectorQuantizer2"):
 class Config:
     """Wraps YAML config loading and access."""
 
-    def __init__(self, config_name, option):
+    def __init__(self, config_name, option=None, env=None, overrides=None):
         self.config_name = config_name
         self.option = option
+        self.env = env
+        self.overrides = overrides or {}
         self.cfg = self._load()
 
     def _load(self):
-        with open(f'test/{self.config_name}.yaml', 'r') as f:
+        with open(f'cfg/{self.config_name}.yaml', 'r') as f:
             config = yaml.safe_load(f)
-        return {**config['DEFAULT'], **config[self.option]}
+
+        if self.option is not None:
+            cfg = {**config['DEFAULT'], **config[self.option]}
+        else:
+            cfg = {**config['DEFAULT']}
+
+        if self.env is not None:
+            with open('cfg/env.json', 'r') as f:
+                env_cfg = json.load(f)[self.env]
+            cfg['MODEL'] = env_cfg['MODEL']
+            cfg['root_path'] = env_cfg['DATASET']
+            cfg['DESTINATION'] = env_cfg['RESULT']
+
+        # CLI overrides
+        for key, value in self.overrides.items():
+            if value is not None:
+                cfg[key] = value
+
+        # Validate required fields
+        required = ['input_image_filename', 'output_dir_name', 'checkpoint_path']
+        missing = [k for k in required if k not in cfg or cfg[k] is None]
+        if missing:
+            raise ValueError(f"Missing required fields: {missing}. Set them in YAML (--option) or via CLI arguments.")
+
+        return cfg
 
     def get(self, key, default=None):
         return self.cfg.get(key, default)
@@ -48,12 +75,12 @@ class VQQModel:
     """Container for VQQ2 model components."""
 
     def __init__(self, ckpt, epoch):
-        self.encoder = torch.load(f"{ckpt}encoder_model_epoch_{epoch}.pth", map_location='cpu', weights_only=False)
-        self.decoder = torch.load(f"{ckpt}decoder_model_epoch_{epoch}.pth", map_location='cpu', weights_only=False)
-        self.net_g = torch.load(f"{ckpt}net_g_model_epoch_{epoch}.pth", map_location='cpu', weights_only=False)
-        self.quantize = torch.load(f"{ckpt}quantize_model_epoch_{epoch}.pth", map_location='cpu', weights_only=False)
-        self.quant_conv = torch.load(f"{ckpt}quant_conv_model_epoch_{epoch}.pth", map_location='cpu', weights_only=False)
-        self.post_quant_conv = torch.load(f"{ckpt}post_quant_conv_model_epoch_{epoch}.pth", map_location='cpu', weights_only=False)
+        self.encoder = torch.load(os.path.join(ckpt, f"encoder_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.decoder = torch.load(os.path.join(ckpt, f"decoder_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.net_g = torch.load(os.path.join(ckpt, f"net_g_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.quantize = torch.load(os.path.join(ckpt, f"quantize_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.quant_conv = torch.load(os.path.join(ckpt, f"quant_conv_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.post_quant_conv = torch.load(os.path.join(ckpt, f"post_quant_conv_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
 
     def to(self, device):
         for attr in ['encoder', 'decoder', 'net_g', 'quantize', 'quant_conv', 'post_quant_conv']:
@@ -101,9 +128,10 @@ class ModelLoader:
 
     def _load_model(self):
         cfg = self.cfg.cfg if isinstance(self.cfg, Config) else self.cfg
-        ckpt_root = f"{cfg['SOURCE']}/logs/{cfg['prj']}"
+        ckpt_root = os.path.join(cfg['MODEL'], cfg['checkpoint_path'])
         epoch = cfg['epoch']
         model_type = cfg['model_type']
+        print(f"Loading model from checkpoint, epoch: {epoch}, model type: {model_type}")
 
         if model_type == 'AE':
             model = self._load_ae(ckpt_root, epoch)
@@ -124,7 +152,7 @@ class ModelLoader:
         return model
 
     def _load_ae(self, ckpt_root, epoch):
-        args = read_json_to_args(f"{ckpt_root}0.json")
+        args = read_json_to_args(os.path.join(ckpt_root, "0.json"))
         model_module = import_model(ckpt_root, model_name=args.models)
         model = model_module.GAN(args, train_loader=None, eval_loader=None, checkpoints=None)
         model = load_pth(model, root=ckpt_root, epoch=epoch,
@@ -132,11 +160,11 @@ class ModelLoader:
         return model
 
     def _load_gan(self, ckpt_root, epoch):
-        model_path = f"{ckpt_root}checkpoints/net_g_model_epoch_{epoch}.pth"
+        model_path = os.path.join(ckpt_root, f"checkpoints/net_g_model_epoch_{epoch}.pth")
         return torch.load(model_path, map_location='cpu')
 
     def _load_vqq2(self, ckpt_root, epoch):
-        ckpt = f"{ckpt_root}checkpoints/"
+        ckpt = os.path.join(ckpt_root, "checkpoints")
         return VQQModel(ckpt, epoch)
 
 
@@ -152,7 +180,7 @@ class ImageLoader:
         self.img = None
 
     def load(self):
-        image_path = self.cfg['root_path'] + self.cfg['image_path'][0]
+        image_path = self.cfg['root_path'] + self.cfg['input_image_filename']
         print(f"Loading: {image_path}")
         img = tiff.imread(image_path) # (Z, Y, X) # (237, 2763, 2756)
         self.img = self.normalizer.forward_normalization(
@@ -473,21 +501,34 @@ class InferencePipeline:
 
     def __init__(self, args):
         self.args = args
-        self.config = Config(args.config, args.option)
+        overrides = {
+            'input_image_filename': args.input_image_filename,
+            'output_dir_name': args.output_dir_name,
+            'checkpoint_path': args.checkpoint_path,
+            'epoch': args.epoch,
+        }
+        self.config = Config(args.config, args.option, env=args.env, overrides=overrides)
+
+        # Read pipeline settings from config
+        self.fp16 = self.config.get('fp16', False)
+        self.augmentation = self.config.get('augmentation', 'encode')
+        self.save_targets = self.config.get('save', ['ori', 'xy'])
+        self.output_format = self.config.get('output_format', 'tiff')
+        self.output_datatype = self.config.get('output_datatype', 'float32')
 
         # Setup output directory
-        self.dest = os.path.join(self.config['DESTINATION'], self.config['dataset'])
+        self.dest = os.path.join(self.config['DESTINATION'], self.config['output_dir_name'])
         self._setup_output_dirs()
 
         # Determine devices
-        if args.gpu:
-            self.num_gpus = torch.cuda.device_count()
-            if self.num_gpus == 0:
-                raise RuntimeError("--gpu specified but no CUDA devices found")
-            self.devices = [f'cuda:{i}' for i in range(self.num_gpus)]
-        else:
+        if args.cpu:
             self.num_gpus = 1
             self.devices = ['cpu']
+        else:
+            self.num_gpus = torch.cuda.device_count()
+            if self.num_gpus == 0:
+                raise RuntimeError("No CUDA devices found. Use --cpu to run on CPU.")
+            self.devices = [f'cuda:{i}' for i in range(self.num_gpus)]
 
         print(f"Using {self.num_gpus} device(s): {self.devices}")
 
@@ -498,14 +539,14 @@ class InferencePipeline:
             loader = ModelLoader(
                 self.config,
                 device=device,
-                fp16=args.fp16,
-                augmentation=args.augmentation
+                fp16=self.fp16,
+                augmentation=self.augmentation
             )
             proc = PatchProcessor(
                 loader.model_proc,
                 loader.upsample,
                 self.config.get('input_augmentation', [None]),
-                fp16=args.fp16,
+                fp16=self.fp16,
                 gpu=(device != 'cpu'),
                 device=device
             )
@@ -524,7 +565,7 @@ class InferencePipeline:
         cfg = self.config.cfg
         _, _, zz, yy, xx = img_shape
 
-        if cfg['assemble_params'].get('testwhole', True):
+        if cfg.get('testwhole', True):
             zstep = int(eval(cfg['assemble_params']['zrange'][-1]))
             ystep = int(eval(cfg['assemble_params']['yrange'][-1]))
             xstep = int(eval(cfg['assemble_params']['xrange'][-1]))
@@ -542,12 +583,12 @@ class InferencePipeline:
         # Load and preprocess image
         self.image_loader.load() # (B, C, Z, Y, X) # (1, 1, 237, 2763, 2756)
         self.image_loader.apply_percentile_norm() # (B, C, Z, Y, X) # (1, 1, 237, 2763, 2756)
-        patch_shape = self.config['assemble_params']['dx_shape']
+        patch_shape = self.config['assemble_params']['patch_shape']
         dz, dy, dx = patch_shape
 
         # Get crop margin C for padding (to preserve original size after assembly)
         crop_margin = None
-        if self.config.cfg['assemble_params'].get('testwhole', True):
+        if self.config.cfg.get('testwhole', True):
             crop_margin = self.config['assemble_params']['C']
 
         self.image_loader.pad(crop_margin=crop_margin) # (B, C, Z, Y, X) # (1, 1, 260, 2912, 2912)
@@ -560,13 +601,13 @@ class InferencePipeline:
 
         # Create one assembler per save target
         assemblers = {}
-        for target in self.args.save:
+        for target in self.save_targets:
             assemblers[target] = PatchAssembler(
                 cfg=self.config.cfg,
                 dest=self.dest,
                 target_name=target,
-                output_format=self.args.output_format,
-                output_datatype=self.args.output_datatype,
+                output_format=self.output_format,
+                output_datatype=self.output_datatype,
                 zrange=zrange, xrange=xrange, yrange=yrange,
                 output_channel=self.config.get('output_channel', 1)
             )
@@ -636,12 +677,12 @@ class InferencePipeline:
             assemble_future.result()
         assemble_executor.shutdown(wait=True)
 
-        if self.args.output_format == 'tiff':
+        if self.output_format == 'tiff':
             for target, asm in assemblers.items():
                 if hasattr(asm, 'output_path'):
                     print(f"[tiff] {target} assembly complete: {', '.join(asm.output_path + '_' + str(c) for c in range(asm.output_channel))}")
 
-        if self.args.output_format == 'zarr':
+        if self.output_format == 'zarr':
             for target, asm in assemblers.items():
                 if hasattr(asm, 'zarr_path'):
                     print(f"[zarr] {target} assembly complete: {asm.zarr_path}")
@@ -654,19 +695,15 @@ class InferencePipeline:
 # =============================================================================
 def parse_args():
     parser = argparse.ArgumentParser(description='Microscopy inference + assembly')
+    parser.add_argument('--env', type=str, default=None, help='Environment name from env.json (e.g. GHCL10, runpod, docker, ...)')
     parser.add_argument('--config', type=str, required=True, help='Config file name (without .yaml)')
-    parser.add_argument('--option', type=str, required=True, help='Option/dataset name in config')
-    parser.add_argument('--gpu', action='store_true', help='Use GPU')
-    parser.add_argument('--fp16', action='store_true', help='Use FP16 precision')
-    parser.add_argument('--augmentation', type=str, default='encode', choices=['encode', 'decode'],
-                        help='Augmentation stage: encode or decode')
-    parser.add_argument('--save', nargs='+', default=['ori', 'xy'],
-                        help='Targets to assemble: ori, xy')
-    parser.add_argument('--output_format', type=str, default='tiff', choices=['tiff', 'zarr'],
-                        help='Output format: tiff (per-slice) or zarr (5D volume)')
-    parser.add_argument('--output_datatype', type=str, default='float32',
-                        choices=['float32', 'uint8', 'uint16'],
-                        help='Output data type')
+    parser.add_argument('--option', type=str, default=None, help='Option/dataset name in config (optional, overrides DEFAULT)')
+    parser.add_argument('--cpu', action='store_true', help='Use CPU instead of GPU')
+    # CLI overrides for config values
+    parser.add_argument('--input_image_filename', type=str, default=None, help='Input image filename (overrides config)')
+    parser.add_argument('--output_dir_name', type=str, default=None, help='Output directory name (overrides config)')
+    parser.add_argument('--checkpoint_path', type=str, default=None, help='Checkpoint path relative to SOURCE (overrides config)')
+    parser.add_argument('--epoch', type=int, default=None, help='Model epoch (overrides config)')
     return parser.parse_args()
 
 

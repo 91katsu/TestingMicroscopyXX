@@ -1,0 +1,49 @@
+DEFAULT:
+  z_scale_ratio: 4  # 4 for 4X SR
+  testwhole: True
+  upsample_params:
+    size: [64, 256, 256]
+  assemble_params:
+    C: [16, 16, 16]
+    S: [16, 16, 16]
+    patch_shape: [64, 256, 256]
+    weight_shape: [224, 224, 224]
+    zrange: [0, 256 - 13 * 4, 13 * 4]
+    xrange: [0, 1024 - 13 * 16, 13 * 16]
+    yrange: [0, 1024 - 13 * 16, 13 * 16]
+
+  # image setting
+  norm_method: ["11"]
+  trd: [[ None, None]]
+  norm_percentile: [0.1, 99.9]
+
+  # model setting
+  model_type: "VQQ2"
+  epoch: 500
+  hbranchz: true
+  downbranch: 2 # 2 for 4X SR
+  checking_codebook: true
+  decode_augmentation: false
+  mc: 1
+  input_augmentation: [null, 'transpose']
+  output_channel: 1
+
+  # pipeline settings
+  fp16: false
+  augmentation: "encode"
+  save: ["ori", "xy"]
+  output_format: "tiff"
+  output_datatype: "float32"
+
+# you can use --option <name> to select a section below, its values will override DEFAULT
+filopodia:
+  input_image_filename: "10X_G0431__6xGFP_incubator_10xSp_4d_Ch-GFP_G-ch-bio_SA635_1_Stitch.tif"
+  output_dir_name: "filopodia_test"
+  checkpoint_path: "logs/filopodia/default/max10skip4/"
+  testwhole: True
+
+
+  # paths resolved via --env:
+  # checkpoint = SOURCE/checkpoint_path
+  # input      = DATASET/input_image_filename
+  # output     = RESULT/output_dir_name

@@ -1,0 +1,45 @@
+DEFAULT:
+  z_scale_ratio: 8  # 8 for 8X SR
+  testwhole: True
+  upsample_params:
+    size: [32, 256, 256]
+  assemble_params:
+    C: [16, 16, 16]
+    S: [16, 16, 16]
+    patch_shape: [32, 256, 256]
+    weight_shape: [224, 224, 224]
+    zrange: [0, 256 - 13 * 2, 13 * 2]
+    xrange: [0, 1024 - 13 * 16, 13 * 16]
+    yrange: [0, 1024 - 13 * 16, 13 * 16]
+
+  # image setting
+  norm_method: ["11"]
+  trd: [[ None, None]]
+  norm_percentile: [0.1, 99.9]
+
+  # model setting
+  model_type: "VQQ2"
+  epoch: 500
+  hbranchz: true
+  downbranch: 1 # 1 for 8X SR
+  checking_codebook: true
+  decode_augmentation: false
+  mc: 1
+  input_augmentation: [null, 'transpose']
+  output_channel: 1
+
+  # pipeline settings
+  fp16: false
+  augmentation: "encode"
+  save: ["ori", "xy"]
+  output_format: "tiff"
+  output_datatype: "float32"
+
+# you can use --option <name> to select a section below, its values will override DEFAULT
+# test:
+#      ...
+
+  # paths resolved via --env:
+  # checkpoint = SOURCE/checkpoint_path
+  # input      = DATASET/input_image_filename
+  # output     = RESULT/output_dir_name

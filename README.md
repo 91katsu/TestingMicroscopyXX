@@ -31,124 +31,148 @@ TestingMicroscopyXX/
 ├── test.py                # Main inference script
 ├── run.sh                 # Execution examples
 ├── requirements.txt       # Dependencies
+├── cfg/                   # Configuration files
+│   ├── env.json           # Environment settings
+│   ├── 2xSR.yaml          # 2x super-resolution config
+│   ├── 4xSR.yaml          # 4x super-resolution config
+│   └── 8xSR.yaml          # 8x super-resolution config
 ├── models/                # Model definitions
-│   ├── base.py            # Base classes, VGG losses
-│   ├── ae0iso0tc.py       # AutoEncoder model
-│   └── CUT.py             # Contrastive Unpaired Translation
 ├── networks/              # Neural network architectures
 ├── utils/                 # Utility modules
-├── ldm/                   # Latent Diffusion Model components
-├── taming/                # VQGAN/taming modules
-└── test/                  # YAML configuration files
+└── ldm/                   # Latent Diffusion Model components
 ```
 
-## Installation
+## Getting Started
 
-```bash
-pip install -r requirements.txt
-```
+### Requirements
 
-### Key Dependencies
+- `Python ≥ 3.10`
 
-- PyTorch 1.10.0
-- PyTorch Lightning 1.9.5
-- tifffile, OpenCV, scikit-image
-- albumentations, einops
+### Installation
+1. Create and Activate a Virtual Environment:
+   ```bash
+   conda create -n testing-microscopy python=3.10
+   conda activate testing-microscopy
+   ```
+2. Install PyTorch [here](https://pytorch.org/get-started/locally/) according to your system and CUDA configuration.
+   ```bash
+   # Example: install PyTorch with CUDA 12.6
+   pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+   ```
+3. Install dependencies:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
 ## Usage
 
 Run inference and assembly in one step. By default, all available GPUs on the device are used for inference. To specify which GPUs to use, set `CUDA_VISIBLE_DEVICES` (e.g., `CUDA_VISIBLE_DEVICES=0,2` to use GPU 0 and 2):
 
 ```bash
-# Output as TIFF (default, uses all available GPUs)
-python test.py --gpu --config filopodiaX4 --option ENC
+# Uses all available GPUs by default
+python test.py --env GaryLab10 --config 4xSR --option filopodia
 
 # Use specific GPUs
-# CUDA_VISIBLE_DEVICES=0,1 python test.py --gpu --config filopodiaX4 --option ENC
+# CUDA_VISIBLE_DEVICES=0,1 python test.py --env GaryLab00 --config 4xSR --option filopodia
 
-# Output as Zarr
-# python test.py --gpu --config filopodiaX4 --option ENC --output_format zarr
-
-# Only want to output enhanced result
-# python test.py --gpu --config filopodiaX4 --option ENC --save xy
+# Run on CPU
+# python test.py --env GaryLab00 --config 4xSR --option filopodia --cpu
 ```
 
 **Arguments:**
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--config` | Config file name in `test/` (without `.yaml`) | required |
-| `--option` | Model section in config (e.g. `ENC`) | required |
-| `--gpu` | Use GPU acceleration | off |
-| `--fp16` | Use FP16 mixed-precision inference | off |
-| `--augmentation` | Augmentation stage: `encode` or `decode` | `encode` |
-| `--save` | Targets to save: `ori` (upsampled input), `xy` (enhanced result) | `ori xy` |
-| `--output_format` | `tiff` (per-slice) or `zarr` (5D volume) | `tiff` |
-| `--output_datatype` | `float32`, `uint8`, or `uint16` | `float32` |
+| `--config` | Config file name in `cfg/` (without `.yaml`) | required |
+| `--option` | Model section in config (overrides `DEFAULT`) | `None` |
+| `--env` | Environment name from `env.json` | `None` |
+| `--cpu` | Use CPU instead of GPU | off |
+| `--input_image_filename` | Input image filename (overrides config) | `None` |
+| `--output_dir_name` | Output directory name (overrides config) | `None` |
+| `--checkpoint_path` | Checkpoint path (overrides config) | `None` |
+| `--epoch` | Model epoch (overrides config) | `None` |
 
-## Configuration
+### Configuration
 
-YAML config files in `test/` have two sections: `DEFAULT` (shared parameters) and a model section (e.g. `ENC`):
+#### Environment (`cfg/env.json`)
+
+Define named environments to set dataset, model, and result paths. Use `--env` to select one at runtime:
+
+```json
+{
+    "Docker": {
+        "DATASET": "/workspace/data/",
+        "MODEL": "/workspace/models/",
+        "RESULT": "/workspace/results/"
+    },
+    "GaryLab10": {
+        "DATASET": "/path/to/data/",
+        "MODEL": "/path/to/models/",
+        "RESULT": "/path/to/results/"
+    }
+}
+```
+
+#### YAML Config (`cfg/*.yaml`)
+
+YAML config files have two sections: `DEFAULT` (shared parameters) and an option section selected via `--option`:
 
 ```yaml
 DEFAULT:
-  SOURCE: '/path/to/models/'              # {SOURCE}/logs/{prj} = full model checkpoint path
-  root_path: '/path/to/input/data/'       # {root_path}/{image_path[0]} = full input image path
-  DESTINATION: '/path/to/output/'         # {DESTINATION}/{dataset} = full output path
-  upsample_params:                        # trilinear upsample target size
-    size: [32, 256, 256]                  # same with dx_shape if no upsample
+  z_scale_ratio: 4                        # Z-axis scale factor (8 for 8X, 4 for 4X, 2 for 2X)
+  testwhole: True                         # process entire volume
+  upsample_params:
+    size: [64, 256, 256]                  # trilinear upsample target size
   assemble_params:
     C: [16, 16, 16]                       # crop margin per side (pixels)
     S: [16, 16, 16]                       # overlap for tapered blending
-    dx_shape: [32, 256, 256]              # inference patch size (Z, Y, X)
-    # 8X SR -> dx_shape = [256/8, 256, 256] = [32, 256, 256]
-    # 4X SR -> dx_shape = [256/4, 256, 256] = [64, 256, 256]
-    # 2X SR -> dx_shape = [256/2, 256, 256] = [128, 256, 256]
-    weight_shape: [224, 224, 224]         # dx_shape - C * 2
-    weight_method: "cross"                # currently only one method available, no need to change 
-    testwhole: True                       # process entire volume
-    # If testwhole = False, the default ROI size for testing is (256, 1024, 1024)
-    zrange: [0, 256 - 13 * 2, 13 * 2]     # [start, end, step]
+    patch_shape: [64, 256, 256]           # inference patch size (Z, Y, X)
+    weight_shape: [224, 224, 224]         # patch_shape - C * 2
+    zrange: [0, 256 - 13 * 4, 13 * 4]    # [start, end, step]
     xrange: [0, 1024 - 13 * 16, 13 * 16]
     yrange: [0, 1024 - 13 * 16, 13 * 16]
-    # If testwhole = True, only the step value matters (start and end are auto-calculated from image size)
-    # 8X SR -> zrange = [0, 256 - 13 * 16/8, 13 * 16/8]
-    #          yrange = [0, 1024 - 13 * 16, 13 * 16]
-    #          xrange = [0, 1024 - 13 * 16, 13 * 16]
-    # 4X SR -> zrange = [0, 256 - 13 * 16/4, 13 * 16/4]
-    #          yrange = [0, 1024 - 13 * 16, 13 * 16]
-    #          xrange = [0, 1024 - 13 * 16, 13 * 16]
-    # 2X SR -> zrange = [0, 256 - 13 * 16/2, 13 * 16/2]
-    #          yrange = [0, 1024 - 13 * 16, 13 * 16]
-    #          xrange = [0, 1024 - 13 * 16, 13 * 16]
-  mc: 1                                   # Monte Carlo passes
-  input_augmentation: [null, 'transpose'] # test-time augmentations
-  output_channel: 1                       # number of output channels in the assembled volume
-  z_scale_ratio: 8                        # Z-axis scale factor
-  # 8X SR -> z_scale_ratio = 8
-  # 4X SR -> z_scale_ratio = 4
-  # 2X SR -> z_scale_ratio = 2
+    # If testwhole = True, only the step value matters
 
-ENC:
-  dataset: "filopodia"                    # {DESTINATION}/{dataset} = full output path
-  image_list_path: null                   # not currently used, no need to change
-  image_path: ["input.tif"]               # {root_path}/{image_path[0]} = full input image path
-  prj: "project/experiment/"              # {SOURCE}/logs/{prj} = full model checkpoint path
-  epoch: 500                              # checkpoint epoch
+  # image setting
+  norm_method: ["11"]                     # '00'=as-is, '01'=0-1, '11'=-1~1
+  trd: [[ None, None]]                    # intensity clipping thresholds [lower, upper]. [None, None] = no clipping
+  norm_percentile: [0.1, 99.9]            # percentile clipping range applied after normalization
+
+  # model setting
   model_type: "VQQ2"                      # AE / GAN / VQQ2
+  epoch: 500                              # checkpoint epoch
   hbranchz: true                          # use encoder posterior as h-branch input (VQQ2 only)
-  downbranch: 1                           # 1 for 8X SR, 2 for 4X SR, 4 for 2X SR
+  downbranch: 2                           # 1 for 8X SR, 2 for 4X SR, 4 for 2X SR
   checking_codebook: true                 # log VQ codebook usage during inference (VQQ2 only)
   decode_augmentation: false              # apply additional augmentations during decoding
-  norm_method: ["11"]                     # '00'=as-is, '01'=0-1, '11'=-1~1
-  trd: [[ None, None]]                    # intensity clipping thresholds [lower, upper] before normalization. [None, None] = no clipping
-  norm_mean_std: null                     # not currently used
-  norm_percentile: [0.1, 99.9]            # percentile clipping range applied after normalization
+  mc: 1                                   # Monte Carlo passes
+  input_augmentation: [null, 'transpose'] # test-time augmentations
+  output_channel: 1                       # number of output channels
+
+  # pipeline settings
+  fp16: false                             # FP16 mixed-precision inference
+  augmentation: "encode"                  # augmentation stage: encode or decode
+  save: ["ori", "xy"]                     # targets: ori (upsampled input), xy (enhanced result)
+  output_format: "tiff"                   # tiff (per-slice) or zarr (5D volume)
+  output_datatype: "float32"              # float32, uint8, or uint16
+
+# use --option filopodia to select this section (overrides DEFAULT)
+filopodia:
+  input_image_filename: "input.tif"       # DATASET/input_image_filename
+  output_dir_name: "filopodia"       # RESULT/output_dir_name
+  checkpoint_path: "logs/filopodia/default/max10skip4/"   # MODEL/checkpoint_path
+
+  # any parameter defined here will override the same parameter in DEFAULT
+  # For example:
+  epoch: 1000
+  testwhole: False
 ```
+
+**Note:** Parameters follow a priority order: **CLI > Option section > DEFAULT**. For example, if `DEFAULT` sets `testwhole: False` but `filopodia` sets `testwhole: True`, the pipeline uses `True`. CLI arguments (`--input_image_filename`, `--output_dir_name`, `--checkpoint_path`, `--epoch`) override both — if `DEFAULT` sets `epoch: 500` and you run with `--epoch 600`, the pipeline uses `600`.
 
 ## Workflow
 
-1. **Configure**: Create or select a YAML config file in `test/`
+1. **Configure**: Create or select a YAML config file in `cfg/`
 2. **Run Inference**: Execute `run.sh` to inference and assembly in one step
 3. **Output**: Reconstructed 3D volumes (TIFF or Zarr)
     - Supports uint8, uint16, float32 formats
@@ -156,7 +180,7 @@ ENC:
     - Output formats: TIFF (per-slice) or Zarr (5D volume)
     - Default viewing plane is YZ (TIFF saves one YZ slice per X position; Zarr stores X as the primary axis for the same view)
     
-### Patch Grid Calculation
+## Patch Grid Calculation
 
 The model takes input patches of size `(Z, Y, X) = (256/z_scale_ratio, 256, 256)` and outputs `(256, 256, 256)`. To avoid boundary artifacts, each output patch is cropped by `C` pixels on each side before assembly, resulting in a `(224, 224, 224)` cube. Each cropped patch is then multiplied by a tapered weight that decays toward the edges. Adjacent patches overlap by `S` pixels and are summed in the overlap region for seamless blending. 
 

@@ -29,3 +29,8 @@ outputs/
 notinuse/
 
 CLAUDE.md
+
+# Docker
+Dockerfile
+.dockerignore 
+requirements.docker.txt
