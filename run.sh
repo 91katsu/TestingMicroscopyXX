@@ -7,7 +7,7 @@
 # === Local ===
 
 # Use all available GPUs
-python test_debug.py --env GaryLab10 --config 4xSR --option filopodia
+python test.py --env GaryLab10 --config 4xSR --option filopodia
 
 # Use specific GPUs
 # CUDA_VISIBLE_DEVICES=0,1 python test.py --env GaryLab10 --config 4xSR --option filopodia

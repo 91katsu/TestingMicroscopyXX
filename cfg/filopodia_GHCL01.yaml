@@ -14,7 +14,7 @@ DEFAULT:
 
   # image setting
   norm_method: ["11", "11"]
-  trd: [[ None, None]] # trd: [[0, 65535]]
+  trd: [[0, 65535]]
   norm_percentile: [0.1, 99.9]
 
   # model setting
@@ -37,9 +37,9 @@ DEFAULT:
 
 filopodia:
   input_image_filename: "10X_G0431;6xGFP_incubator_10xSp_4d_Ch-GFP_G-ch-bio_SA635_9_R.tif"
-  output_dir_name: "filopodia_infer_20260316_075006_epoch"
+  output_dir_name: "filopodia_infer_20260208_072910_epoch_"
   checkpoint_path: "logs/filopodia/default/"
-  version: "20260316_075006"
+  version: "20260208_072910"
 
   # paths resolved via --env:
   # checkpoint = SOURCE/checkpoint_path
@@ -47,3 +47,4 @@ filopodia:
   # output     = RESULT/output_dir_name
 
 # python test.py --env GHCL01 --config filopodia_GHCL01 --option filopodia
+# CUDA_VISIBLE_DEVICES=1 python test.py --env GHCL01 --config filopodia_GHCL01 --option filopodia
