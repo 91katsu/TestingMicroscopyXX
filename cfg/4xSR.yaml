@@ -40,8 +40,6 @@ filopodia:
   input_image_filename: "10X_G0431__6xGFP_incubator_10xSp_4d_Ch-GFP_G-ch-bio_SA635_1_Stitch.tif"
   output_dir_name: "filopodia_test"
   checkpoint_path: "logs/filopodia/default/max10skip4/"
-  testwhole: True
-
 
   # paths resolved via --env:
   # checkpoint = SOURCE/checkpoint_path

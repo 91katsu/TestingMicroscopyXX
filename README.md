@@ -24,6 +24,10 @@ This project performs inference and reconstruction on 3D microscopy images using
 - Blood vessel imaging
 - Organoid imaging
 
+## Docker Support (Optional)
+
+For a quick start, you can use our pre-built Docker image to run inference on our demo data. See the [Docker Usage Guide](docker_usage.md).
+
 ## Project Structure
 
 ```
@@ -128,9 +132,9 @@ DEFAULT:
     S: [16, 16, 16]                       # overlap for tapered blending
     patch_shape: [64, 256, 256]           # inference patch size (Z, Y, X)
     weight_shape: [224, 224, 224]         # patch_shape - C * 2
-    zrange: [0, 256 - 13 * 4, 13 * 4]    # [start, end, step]
-    xrange: [0, 1024 - 13 * 16, 13 * 16]
-    yrange: [0, 1024 - 13 * 16, 13 * 16]
+    zrange: [0, 256, 13 * 4]    # [start, end, step]
+    xrange: [0, 1024, 13 * 16]
+    yrange: [0, 1024, 13 * 16]
     # If testwhole = True, only the step value matters
 
   # image setting
@@ -168,7 +172,7 @@ filopodia:
   testwhole: False
 ```
 
-**Note:** Parameters follow a priority order: **CLI > Option section > DEFAULT**. For example, if `DEFAULT` sets `testwhole: False` but `filopodia` sets `testwhole: True`, the pipeline uses `True`. CLI arguments (`--input_image_filename`, `--output_dir_name`, `--checkpoint_path`, `--epoch`) override both — if `DEFAULT` sets `epoch: 500` and you run with `--epoch 600`, the pipeline uses `600`.
+**Note:** Parameters passed via CLI will override the YAML option section, and the option section will override default section. 
 
 ## Workflow
 
