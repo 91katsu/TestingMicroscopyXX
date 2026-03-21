@@ -1,0 +1,17 @@
+grid:
+  testwhole: True
+  roi:
+    z: [0, 256]
+    y: [0, 2048]
+    x: [0, 2048]
+
+model:
+  epoch: 1700
+
+output:
+  output_datatype: "uint8"
+
+paths:
+  input_img_relpath: "THX10SDM20xw/roiDcrop2.tif"
+  ckpt_relpath: "THX10SDM20xw/max5skip4/checkpoints"
+  output_dir_name: "THX10SDM20xw"

@@ -1,0 +1,9 @@
+patch:
+  patch_shape: [128, 256, 256]
+
+grid:
+  step:
+    z: 13 * 16 / 2
+
+model:
+  downbranch: 4

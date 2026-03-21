@@ -1,0 +1,47 @@
+patch:
+  patch_shape: null            # overridden by cfg/scale/{2x,4x,8x}.yaml
+  upsample_size: ${patch.patch_shape}
+
+assemble:
+  C: [16, 16, 16]
+  S: [16, 16, 16]    
+  weight_shape: [224, 224, 224]
+
+grid:
+  testwhole: True
+  roi:
+    z: [0, 256]
+    y: [0, 1024]
+    x: [0, 1024]
+  step:
+    z: null                    # overridden by cfg/scale/{2x,4x,8x}.yaml
+    y: 13 * 16
+    x: 13 * 16
+
+preprocess:
+  norm_method: ["00"]
+  trd: [[0, 1000]]
+  norm_percentile: [0.1, 99.9]
+
+model:
+  type: "VQQ2"
+  epoch: 500
+  hbranchz: true
+  downbranch: null             # overridden by cfg/scale/{2x,4x,8x}.yaml
+  checking_codebook: true
+  decode_augmentation: false
+  num_mc: 1
+  tta_mode: "encode"
+  tta_method: [null, "transpose"]
+  fp16: false
+
+output:
+  save: ["ori", "xy"]
+  output_format: "tiff"
+  output_datatype: "float32"
+  output_channel: 1
+
+paths:
+  input_img_relpath: null      # required: override in experiment yaml or via CLI
+  ckpt_relpath: null           # required: override in experiment yaml or via CLI
+  output_dir_name: null        # required: override in experiment yaml or via CLI

@@ -14,7 +14,7 @@ import tifffile as tiff
 
 def load_pth(gan, root, epoch, model_names):
     for name in model_names:
-        setattr(gan, name, torch.load(os.path.join(root, f"checkpoints/{name}_model_epoch_{str(epoch)}.pth"),
+        setattr(gan, name, torch.load(os.path.join(root, f"{name}_model_epoch_{str(epoch)}.pth"),
                                       map_location=torch.device('cpu')))
     return gan
 

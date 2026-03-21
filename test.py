@@ -1,12 +1,11 @@
 import argparse
-import json
 import os
 import shutil
 import numpy as np
 import torch
 import torch.nn.functional as F
 import tifffile as tiff
-import yaml
+from omegaconf import OmegaConf
 import zarr
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,49 +22,57 @@ if not hasattr(q, "VectorQuantizer2"):
 # Config
 # =============================================================================
 class Config:
-    """Wraps YAML config loading and access."""
+    """Layered OmegaConf config: base → scale → env → override → cli."""
 
-    def __init__(self, config_name, option=None, env=None, overrides=None):
-        self.config_name = config_name
-        self.option = option
-        self.env = env
-        self.overrides = overrides or {}
-        self.cfg = self._load()
+    def __init__(self, scale=None, env=None, override=None, cli_overrides=None):
+        # 1. Load base config
+        cfg = OmegaConf.load('cfg/base.yaml')
 
-    def _load(self):
-        with open(f'cfg/{self.config_name}.yaml', 'r') as f:
-            config = yaml.safe_load(f)
+        # 2. Merge scale config
+        scale_path = f'cfg/scale/{scale}.yaml'
+        if not os.path.exists(scale_path):
+            raise FileNotFoundError(f"Scale config not found: {scale_path}")
+        cfg = OmegaConf.merge(cfg, OmegaConf.load(scale_path))
+        z_ratio = int(scale.replace('x', ''))
+        cfg = OmegaConf.merge(cfg, OmegaConf.create({'scale': z_ratio}))
 
-        if self.option is not None:
-            cfg = {**config['DEFAULT'], **config[self.option]}
-        else:
-            cfg = {**config['DEFAULT']}
+        # 3. Merge env config
+        if not os.path.exists('cfg/env.yaml'):
+            raise FileNotFoundError("cfg/env.yaml not found. Please read README.md to create this file!")
+        env_all = OmegaConf.load('cfg/env.yaml')
+        if env is None or env not in env_all:
+            available = list(env_all.keys())
+            raise ValueError(f"Environment '{env}' not found in env.yaml. Available: {available}")
+        cfg = OmegaConf.merge(cfg, OmegaConf.create({'env': env_all[env]}))
 
-        if self.env is not None:
-            with open('cfg/env.json', 'r') as f:
-                env_cfg = json.load(f)[self.env]
-            cfg['MODEL'] = env_cfg['MODEL']
-            cfg['root_path'] = env_cfg['DATASET']
-            cfg['DESTINATION'] = env_cfg['RESULT']
+        # 4. Merge override config
+        if override:
+            override_path = f'cfg/{override}.yaml'
+            if not os.path.exists(override_path):
+                raise FileNotFoundError(f"Override config not found: {override_path}")
+            cfg = OmegaConf.merge(cfg, OmegaConf.load(override_path))
 
-        # CLI overrides
-        for key, value in self.overrides.items():
-            if value is not None:
-                cfg[key] = value
+        # 5. Merge CLI overrides (e.g. model.epoch=2000 model.fp16=true)
+        if cli_overrides:
+            cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(cli_overrides))
 
-        # Validate required fields
-        required = ['input_image_filename', 'output_dir_name', 'checkpoint_path']
-        missing = [k for k in required if k not in cfg or cfg[k] is None]
+        # Resolve all interpolations
+        OmegaConf.resolve(cfg)
+
+        # Validate required paths
+        required = ['input_img_relpath', 'ckpt_relpath', 'output_dir_name']
+        missing = [k for k in required if OmegaConf.select(cfg, f'paths.{k}') is None]
         if missing:
-            raise ValueError(f"Missing required fields: {missing}. Set them in YAML (--option) or via CLI arguments.")
+            raise ValueError(f"Missing required fields in paths: {missing}")
 
-        return cfg
+        # Build runtime paths with os.path.join (avoids double-slash issues)
+        cfg.runtime = OmegaConf.create({
+            'input_img_path': os.path.join(cfg.env.DATASET, cfg.paths.input_img_relpath),
+            'ckpt_root_path': os.path.join(cfg.env.MODEL, cfg.paths.ckpt_relpath),
+            'output_dir': os.path.join(cfg.env.RESULT, cfg.paths.output_dir_name),
+        })
 
-    def get(self, key, default=None):
-        return self.cfg.get(key, default)
-
-    def __getitem__(self, key):
-        return self.cfg[key]
+        self.cfg = cfg
 
 
 # =============================================================================
@@ -104,41 +111,41 @@ class VQQModel:
 class ModelLoader:
     """Handles model loading for different model types."""
 
-    def __init__(self, cfg, device='cpu', fp16=False, augmentation='encode'):
+    def __init__(self, cfg, device='cpu'):
         self.cfg = cfg
         self.device = torch.device(device)
         self.gpu = (self.device.type == 'cuda')
-        self.fp16 = fp16
-        self.augmentation = augmentation
 
         self.model = self._load_model()
-        self.upsample = torch.nn.Upsample(size=cfg['upsample_params']['size'], mode='trilinear')
+        self.upsample = torch.nn.Upsample(size=list(cfg.patch.upsample_size), mode='trilinear')
 
         if self.gpu:
             self.upsample = self.upsample.to(self.device)
 
+        # Create flat dict from model config for ModelProcesser compatibility
+        model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
+        model_kwargs['model_type'] = model_kwargs.pop('type')
         self.model_proc = ModelProcesser(
-            cfg.cfg if isinstance(cfg, Config) else cfg,
+            model_kwargs,
             self.model,
             gpu=self.gpu,
-            augmentation=augmentation,
-            fp16=fp16,
+            augmentation=cfg.model.tta_mode,
+            fp16=cfg.model.fp16,
             device=self.device
         )
 
     def _load_model(self):
-        cfg = self.cfg.cfg if isinstance(self.cfg, Config) else self.cfg
-        ckpt_root = os.path.join(cfg['MODEL'], cfg['checkpoint_path'])
-        epoch = cfg['epoch']
-        model_type = cfg['model_type']
+        ckpt_root_path = self.cfg.runtime.ckpt_root_path
+        epoch = self.cfg.model.epoch
+        model_type = self.cfg.model.type
         print(f"Loading model from checkpoint, epoch: {epoch}, model type: {model_type}")
 
         if model_type == 'AE':
-            model = self._load_ae(ckpt_root, epoch)
+            model = self._load_ae(ckpt_root_path, epoch)
         elif model_type == 'GAN':
-            model = self._load_gan(ckpt_root, epoch)
+            model = self._load_gan(ckpt_root_path, epoch)
         elif model_type == 'VQQ2':
-            model = self._load_vqq2(ckpt_root, epoch)
+            model = self._load_vqq2(ckpt_root_path, epoch)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -146,26 +153,25 @@ class ModelLoader:
             model = model.to(self.device) if hasattr(model, 'to') else model
         for p in model.parameters():
             p.requires_grad = False
-        if self.fp16:
+        if self.cfg.model.fp16:
             model = model.half()
 
         return model
 
-    def _load_ae(self, ckpt_root, epoch):
-        args = read_json_to_args(os.path.join(ckpt_root, "0.json"))
-        model_module = import_model(ckpt_root, model_name=args.models)
+    def _load_ae(self, ckpt_root_path, epoch):
+        args = read_json_to_args(os.path.join(ckpt_root_path, "0.json"))
+        model_module = import_model(ckpt_root_path, model_name=args.models)
         model = model_module.GAN(args, train_loader=None, eval_loader=None, checkpoints=None)
-        model = load_pth(model, root=ckpt_root, epoch=epoch,
+        model = load_pth(model, root=ckpt_root_path, epoch=epoch,
                          model_names=['encoder', 'decoder', 'net_g', 'post_quant_conv', 'quant_conv'])
         return model
 
-    def _load_gan(self, ckpt_root, epoch):
-        model_path = os.path.join(ckpt_root, f"checkpoints/net_g_model_epoch_{epoch}.pth")
+    def _load_gan(self, ckpt_root_path, epoch):
+        model_path = os.path.join(ckpt_root_path, f"net_g_model_epoch_{epoch}.pth")
         return torch.load(model_path, map_location='cpu')
 
-    def _load_vqq2(self, ckpt_root, epoch):
-        ckpt = os.path.join(ckpt_root, "checkpoints")
-        return VQQModel(ckpt, epoch)
+    def _load_vqq2(self, ckpt_root_path, epoch):
+        return VQQModel(ckpt_root_path, epoch)
 
 
 # =============================================================================
@@ -175,16 +181,17 @@ class ImageLoader:
     """Handles image loading and preprocessing."""
 
     def __init__(self, cfg):
-        self.cfg = cfg.cfg if isinstance(cfg, Config) else cfg
+        self.cfg = cfg
         self.normalizer = DataNormalization(backward_type='float32')
         self.img = None
 
     def load(self):
-        image_path = self.cfg['root_path'] + self.cfg['input_image_filename']
-        print(f"Loading: {image_path}")
+        image_path = self.cfg.runtime.input_img_path
+        print("=" * 50)
+        print(f"Loading image from: {image_path}")
         img = tiff.imread(image_path) # (Z, Y, X) # (237, 2763, 2756)
         self.img = self.normalizer.forward_normalization(
-            img, self.cfg['norm_method'][0], self.cfg['trd'][0]
+            img, self.cfg.preprocess.norm_method[0], self.cfg.preprocess.trd[0]
         ) # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
         return self.img
 
@@ -192,8 +199,9 @@ class ImageLoader:
         if self.img is None:
             raise ValueError("Image not loaded. Call load() first.")
 
-        if self.cfg.get('norm_percentile') is not False:
-            p0, p1 = self.cfg.get('norm_percentile', [0.5, 99.5])
+        norm_pct = self.cfg.preprocess.norm_percentile
+        if norm_pct is not False:
+            p0, p1 = norm_pct
             if not isinstance(p0, (int, float)):
                 p0, p1 = 0.5, 99.5
 
@@ -207,6 +215,14 @@ class ImageLoader:
 
         return self.img # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
 
+    def cropROI(self, zrange, yrange, xrange):
+        """Crop image to specified range (used when testwhole=False)."""
+        if self.img is None:
+            raise ValueError("Image not loaded. Call load() first.")
+        self.img = self.img[:, :, zrange[0]:zrange[1], yrange[0]:yrange[1], xrange[0]:xrange[1]]
+        print(f"Cropped to {self.img.shape}")
+        return self.img
+
     def pad(self, crop_margin=None):
         """
         Pad image for patch-based inference.
@@ -215,31 +231,32 @@ class ImageLoader:
             crop_margin: (Cz, Cy, Cx) pixels cropped from each side during assembly.
                          If provided, pads by C on both sides to preserve original size.
         """
+        print("=" * 50)
         if self.img is None:
             raise ValueError("Image not loaded. Call load() first.")
 
         _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
-
-        print(f"Padding image from {self.img.shape}")
+        print(f"Original size (Z, Y, X): ({Dz}, {Dy}, {Dx})")
 
         # First, pad by crop margin (C) on both sides to preserve original size after assembly
         if crop_margin is not None:
             Cz, Cy, Cx = crop_margin
-            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//self.cfg['z_scale_ratio'] , Cz//self.cfg['z_scale_ratio']), mode='constant', value=self.img.min())
+            z_ratio = self.cfg.scale
+            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//z_ratio, Cz//z_ratio), mode='constant', value=self.img.min())
             _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X) # (1, 1, 245, 2795, 2788)
-            print(f"After C padding: {self.img.shape}")
+            print(f"After C padding size (Z, Y, X): {self.img.shape}")
 
-        zstep = int(eval(self.cfg['assemble_params']['zrange'][-1]))
-        ystep = int(eval(self.cfg['assemble_params']['yrange'][-1]))
-        xstep = int(eval(self.cfg['assemble_params']['xrange'][-1]))
-        # Then, pad to make divisible by patch shape
+        zstep = int(eval(str(self.cfg.grid.step.z)))
+        ystep = int(eval(str(self.cfg.grid.step.y)))
+        xstep = int(eval(str(self.cfg.grid.step.x)))
+        # Then pad to make divisible by patch shape
         Nz = ((Dz // zstep) + 1) * zstep
         Ny = ((Dy // ystep) + 1) * ystep
         Nx = ((Dx // xstep) + 1) * xstep
 
         Pz, Py, Px = Nz - Dz, Ny - Dy, Nx - Dx
         self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.min())
-        print(f"After stride padding: {self.img.shape}")
+        print(f"After stride padding size (Z, Y, X): {self.img.shape}")
 
         return self.img # (1, 1, Z, Y, X) # (1, 1, 260, 2912, 2912)
 
@@ -250,13 +267,13 @@ class ImageLoader:
 class PatchProcessor:
     """Handles inference on patches."""
 
-    def __init__(self, model_proc, upsample, augmentations, fp16=False, gpu=False, device='cpu'):
+    def __init__(self, cfg, model_proc, upsample, device='cpu'):
         self.model_proc = model_proc
         self.upsample = upsample
-        self.augmentations = augmentations
-        self.fp16 = fp16
-        self.gpu = gpu
+        self.tta_method = list(cfg.model.tta_method)
+        self.fp16 = cfg.model.fp16
         self.device = torch.device(device)
+        self.gpu = (self.device.type == 'cuda')
 
     def run(self, x0_list, startIdx_zyx, patchShape_zyx, ii=None):
         # Extract and upsample patch
@@ -271,11 +288,11 @@ class PatchProcessor:
         if self.fp16 and self.gpu:
             patch = patch.half()
             with torch.cuda.amp.autocast():
-                _, Xup, outall, _ = self.model_proc.get_model_result(patch, self.augmentations, ii=ii)
+                _, Xup, outall, _ = self.model_proc.get_model_result(patch, self.tta_method, ii=ii)
         else:
             # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
             # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
-            _, Xup, outall, _ = self.model_proc.get_model_result(patch, self.augmentations, ii=ii)
+            _, Xup, outall, _ = self.model_proc.get_model_result(patch, self.tta_method, ii=ii)
 
         outall = outall.numpy().astype(np.float32) # (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
         Xup = Xup.numpy().astype(np.float32) # (Z, C, Y, X) # (256, 1, 256, 256)
@@ -295,14 +312,13 @@ class PatchProcessor:
 # =============================================================================
 class PatchAssembler:
 
-    def __init__(self, cfg, dest, target_name, output_format, output_datatype,
-                 zrange, xrange, yrange, output_channel):
-        self.Cz, self.Cy, self.Cx = cfg['assemble_params']['C']
-        self.Sz, self.Sy, self.Sx = cfg['assemble_params']['S']
-        self.weight_shape = cfg['assemble_params']['weight_shape']
-        self.output_datatype = output_datatype
-        self.output_format = output_format
-        self.output_channel = output_channel
+    def __init__(self, cfg, target_name, zrange, xrange, yrange):
+        self.Cz, self.Cy, self.Cx = cfg.assemble.C
+        self.Sz, self.Sy, self.Sx = cfg.assemble.S
+        self.weight_shape = list(cfg.assemble.weight_shape)
+        self.output_format = cfg.output.output_format
+        self.output_datatype = cfg.output.output_datatype
+        self.output_channel = cfg.output.output_channel
         self.zrange = zrange
         self.xrange = xrange
         self.yrange = yrange
@@ -312,10 +328,10 @@ class PatchAssembler:
         self.current_x_position = 0
 
         # Setup output
-        self.output_path = os.path.join(dest, target_name + '_assemble')
-        if output_format == 'tiff':
+        self.output_path = os.path.join(cfg.runtime.output_dir, target_name + '_assemble')
+        if self.output_format == 'tiff':
             self._init_tiff_dirs()
-        elif output_format == 'zarr':
+        elif self.output_format == 'zarr':
             self._init_zarr_store()
 
     def _init_tiff_dirs(self):
@@ -334,11 +350,10 @@ class PatchAssembler:
         fY = int(wY * ny - (ny - 1) * self.Sy)
         fX = int(wX * nx - (nx - 1) * self.Sx - self.Sx)
 
-        C = self.output_channel
         save_dtype = np.dtype(self.output_datatype)
 
         # TCZYX 5D for OME-Zarr: store X as zarr Z-axis (side view)
-        shape_5d = (1, C, fX, fZ, fY)
+        shape_5d = (1, self.output_channel, fX, fZ, fY)
         chunks_5d = (1, 1, 20, 512, 512)
 
         zarr_path = self.output_path + '.zarr'
@@ -350,18 +365,24 @@ class PatchAssembler:
         self.zarr_path = zarr_path
         print(f"[zarr] Created store: {zarr_path}, shape TCZYX={shape_5d}")
 
-    def store_patch(self, nz, ny, data, is_outall=False):
-        """Store a patch for the current X loop.
+    def _write_column_tiff(self, one_zy_block, Sx):
+        """Write assembled column as per-X-position TIFF slices."""
+        for x in range(0, one_zy_block.shape[1] - Sx):
+            for c in range(one_zy_block.shape[0]):
+                slice_data = one_zy_block[c, x, :, :]
+                slice_data = self._convert_dtype(slice_data)
+                tiff.imwrite(
+                    os.path.join(self.output_path + '_' + str(c),
+                                 'slice_x_' + str(self.current_x_position + x).zfill(4) + '.tif'),
+                    slice_data
+                )
 
-        Args:
-            nz, ny: grid indices within current X loop
-            data: outall (Z,C,Y,X,aug) if is_outall, else Xup (Z,C,Y,X)
-            is_outall: True if data has augmentation dimension to average
-        """
-        if is_outall:
-            data = data.mean(axis=-1)  # average augmentations => (Z, C, Y, X, aug) -> (Z, C, Y, X)
-        patch = np.transpose(data, (1, 0, 2, 3)).astype(np.float32)  # (C, Z, Y, X)
-        self.patches[(nz, ny)] = patch
+    def _write_column_zarr(self, one_zy_block, Sx):
+        """Write assembled column block to zarr store."""
+        block = one_zy_block[:, :one_zy_block.shape[1] - Sx, :, :]
+        block = self._convert_dtype(block)
+        x_len = block.shape[1]
+        self.zarr_out[0, :, self.current_x_position:self.current_x_position + x_len, :, :] = block
 
     def _convert_dtype(self, data):
         """Convert float32 data (roughly -1 to 1 range) to target dtype."""
@@ -371,7 +392,7 @@ class PatchAssembler:
             return np.clip((data + 1) * 32767.5, 0, 65535).astype(np.uint16)
         return data.astype(np.float32)
 
-    def create_tapered_weight(self, Sz, Sy, Sx, nz, ny, nx, size, edge_size: int = 64) -> np.ndarray:
+    def _create_tapered_weight(self, Sz, Sy, Sx, nz, ny, nx, size, edge_size: int = 64) -> np.ndarray:
         """Create a 3D cube with linearly tapered edges in all directions.
 
         Weight axes: 0 → Z (tapered by Sz), 1 → (tapered by Sy), 2 → (tapered by Sx).
@@ -400,6 +421,19 @@ class PatchAssembler:
             weight[:, :, -Sx:] *= taper_Sx[::-1].reshape(1, 1, -1)
 
         return weight
+    
+    def store_patch(self, nz, ny, data, is_outall=False):
+        """Store a patch for the current X loop.
+
+        Args:
+            nz, ny: grid indices within current X loop
+            data: outall (Z,C,Y,X,aug) if is_outall, else Xup (Z,C,Y,X)
+            is_outall: True if data has augmentation dimension to average
+        """
+        if is_outall:
+            data = data.mean(axis=-1)  # average augmentations => (Z, C, Y, X, aug) -> (Z, C, Y, X)
+        patch = np.transpose(data, (1, 0, 2, 3)).astype(np.float32)  # (C, Z, Y, X)
+        self.patches[(nz, ny)] = patch
 
     def assemble_column(self, nx, patches=None):
         """Assemble all patches for X-column index nx and write output.
@@ -425,7 +459,8 @@ class PatchAssembler:
         for nz in range(nz_count):
             one_column = []
             for ny in range(ny_count):
-                # Edge flags: 0 = first patch, -1 = last patch
+                # Edge flags: 
+                # 0 = first patch, -1 = last patch
                 nz_flag = -1 if nz == nz_count - 1 else nz
                 nx_flag = -1 if nx == nx_count - 1 else nx
                 ny_flag = -1 if ny == ny_count - 1 else ny
@@ -434,7 +469,7 @@ class PatchAssembler:
                 patch = patches[(nz, ny)]  # (C, Z, X, Y) # (1, 256, 256, 256)
                 cropped = patch[:, Cz:-Cz, Cy:-Cy, Cx:-Cx] # (C, Z, X, Y) # (1, 224, 224, 224)
 
-                w = self.create_tapered_weight(Sz, Sy, Sx, nz_flag, ny_flag, nx_flag,
+                w = self._create_tapered_weight(Sz, Sy, Sx, nz_flag, ny_flag, nx_flag,
                                           size=self.weight_shape)
                 w = np.stack([w] * cropped.shape[0], axis=0)
                 cropped = np.multiply(cropped, w) # (C, Z, X, Y) # (1, 224, 224, 224)
@@ -473,25 +508,6 @@ class PatchAssembler:
         self.last_block = one_zy_block[:, -Sx:, :, :].copy()
         self.current_x_position += one_zy_block.shape[1] - Sx
 
-    def _write_column_tiff(self, one_zy_block, Sx):
-        """Write assembled column as per-X-position TIFF slices."""
-        for x in range(0, one_zy_block.shape[1] - Sx):
-            for c in range(one_zy_block.shape[0]):
-                slice_data = one_zy_block[c, x, :, :]
-                slice_data = self._convert_dtype(slice_data)
-                tiff.imwrite(
-                    os.path.join(self.output_path + '_' + str(c),
-                                 'slice_x_' + str(self.current_x_position + x).zfill(4) + '.tif'),
-                    slice_data
-                )
-
-    def _write_column_zarr(self, one_zy_block, Sx):
-        """Write assembled column block to zarr store."""
-        block = one_zy_block[:, :one_zy_block.shape[1] - Sx, :, :]
-        block = self._convert_dtype(block)
-        x_len = block.shape[1]
-        self.zarr_out[0, :, self.current_x_position:self.current_x_position + x_len, :, :] = block
-
 
 # =============================================================================
 # InferencePipeline
@@ -501,23 +517,14 @@ class InferencePipeline:
 
     def __init__(self, args):
         self.args = args
-        overrides = {
-            'input_image_filename': args.input_image_filename,
-            'output_dir_name': args.output_dir_name,
-            'checkpoint_path': args.checkpoint_path,
-            'epoch': args.epoch,
-        }
-        self.config = Config(args.config, args.option, env=args.env, overrides=overrides)
-
-        # Read pipeline settings from config
-        self.fp16 = self.config.get('fp16', False)
-        self.augmentation = self.config.get('augmentation', 'encode')
-        self.save_targets = self.config.get('save', ['ori', 'xy'])
-        self.output_format = self.config.get('output_format', 'tiff')
-        self.output_datatype = self.config.get('output_datatype', 'float32')
+        config = Config(scale=args.scale, env=args.env, override=args.override, cli_overrides=args.cli_overrides)
+        self.cfg = config.cfg
+        print("===== Resolved Config =====")
+        print(OmegaConf.to_yaml(self.cfg))
+        print("=" * 50)
 
         # Setup output directory
-        self.dest = os.path.join(self.config['DESTINATION'], self.config['output_dir_name'])
+        self.dest = self.cfg.runtime.output_dir
         self._setup_output_dirs()
 
         # Determine devices
@@ -536,60 +543,44 @@ class InferencePipeline:
         self.workers = []
         for device in self.devices:
             print(f"Loading model on {device}...")
-            loader = ModelLoader(
-                self.config,
-                device=device,
-                fp16=self.fp16,
-                augmentation=self.augmentation
-            )
+            loader = ModelLoader(self.cfg, device=device)
             proc = PatchProcessor(
-                loader.model_proc,
-                loader.upsample,
-                self.config.get('input_augmentation', [None]),
-                fp16=self.fp16,
-                gpu=(device != 'cpu'),
-                device=device
+                self.cfg, loader.model_proc, loader.upsample, device=device
             )
             self.workers.append(proc)
 
-        print("Loading image...")
-        self.image_loader = ImageLoader(self.config)
+        self.image_loader = ImageLoader(self.cfg)
 
     def _setup_output_dirs(self):
         os.makedirs(self.dest, exist_ok=True)
-        # Save config
+        # Save resolved config
         with open(os.path.join(self.dest, 'config.yaml'), 'w') as f:
-            yaml.dump(self.config.cfg, f)
+            f.write(OmegaConf.to_yaml(self.cfg))
 
     def _get_patch_grid(self, img_shape):
-        cfg = self.config.cfg
-        _, _, zz, yy, xx = img_shape
+        _, _, z, y, x = img_shape
 
-        if cfg.get('testwhole', True):
-            zstep = int(eval(cfg['assemble_params']['zrange'][-1]))
-            ystep = int(eval(cfg['assemble_params']['yrange'][-1]))
-            xstep = int(eval(cfg['assemble_params']['xrange'][-1]))
-            zrange = range(0, zz, zstep)
-            yrange = range(0, yy, ystep)
-            xrange = range(0, xx, xstep)
-        else:
-            zrange = range(*[int(eval(str(x))) for x in cfg['assemble_params']['zrange']])
-            yrange = range(*[int(eval(str(x))) for x in cfg['assemble_params']['yrange']])
-            xrange = range(*[int(eval(str(x))) for x in cfg['assemble_params']['xrange']])
+        zstep = int(eval(str(self.cfg.grid.step.z)))
+        ystep = int(eval(str(self.cfg.grid.step.y)))
+        xstep = int(eval(str(self.cfg.grid.step.x)))
 
-        return zrange, yrange, xrange
+        return range(0, z, zstep), range(0, y, ystep), range(0, x, xstep)
 
     def run(self):
         # Load and preprocess image
         self.image_loader.load() # (B, C, Z, Y, X) # (1, 1, 237, 2763, 2756)
         self.image_loader.apply_percentile_norm() # (B, C, Z, Y, X) # (1, 1, 237, 2763, 2756)
-        patch_shape = self.config['assemble_params']['patch_shape']
+        patch_shape = list(self.cfg.patch.patch_shape)
         dz, dy, dx = patch_shape
 
-        # Get crop margin C for padding (to preserve original size after assembly)
-        crop_margin = None
-        if self.config.cfg.get('testwhole', True):
-            crop_margin = self.config['assemble_params']['C']
+        crop_margin = list(self.cfg.assemble.C)
+        # When testwhole=False, crop image to specified range first
+        if not self.cfg.grid.testwhole:
+            zr = list(self.cfg.grid.roi.z)
+            yr = list(self.cfg.grid.roi.y)
+            xr = list(self.cfg.grid.roi.x)
+            self.image_loader.cropROI(zr, yr, xr)
+            crop_margin = None
 
         self.image_loader.pad(crop_margin=crop_margin) # (B, C, Z, Y, X) # (1, 1, 260, 2912, 2912)
         x0 = [self.image_loader.img]
@@ -597,24 +588,23 @@ class InferencePipeline:
         # Get patch grid
         zrange, yrange, xrange = self._get_patch_grid(self.image_loader.img.shape)
         total_patches = len(zrange) * len(yrange) * len(xrange)
+        print("=" * 50)
         print(f"Processing {len(zrange)}x{len(yrange)}x{len(xrange)} = {total_patches} patches")
 
         # Create one assembler per save target
         assemblers = {}
-        for target in self.save_targets:
+        for target in self.cfg.output.save:
             assemblers[target] = PatchAssembler(
-                cfg=self.config.cfg,
-                dest=self.dest,
+                cfg=self.cfg,
                 target_name=target,
-                output_format=self.output_format,
-                output_datatype=self.output_datatype,
-                zrange=zrange, xrange=xrange, yrange=yrange,
-                output_channel=self.config.get('output_channel', 1)
+                zrange=zrange, xrange=xrange, yrange=yrange
             )
 
         print('xrange:', xrange)
         print('zrange:', zrange)
         print('yrange:', yrange)
+        print("=" * 50)
+        print("Starting inference and assembly...")
 
         # Build list of (nz, ny, iz, iy) for each x-column
         column_patches = []
@@ -668,6 +658,7 @@ class InferencePipeline:
                     def _assemble(assemblers, snapshots, nx):
                         for target, asm in assemblers.items():
                             asm.assemble_column(nx, patches=snapshots[target])
+
                     assemble_future = assemble_executor.submit(
                         _assemble, assemblers, patches_snapshots, nx
                     )
@@ -677,12 +668,12 @@ class InferencePipeline:
             assemble_future.result()
         assemble_executor.shutdown(wait=True)
 
-        if self.output_format == 'tiff':
+        if self.cfg.output.output_format == 'tiff':
             for target, asm in assemblers.items():
                 if hasattr(asm, 'output_path'):
                     print(f"[tiff] {target} assembly complete: {', '.join(asm.output_path + '_' + str(c) for c in range(asm.output_channel))}")
 
-        if self.output_format == 'zarr':
+        if self.cfg.output.output_format == 'zarr':
             for target, asm in assemblers.items():
                 if hasattr(asm, 'zarr_path'):
                     print(f"[zarr] {target} assembly complete: {asm.zarr_path}")
@@ -695,16 +686,14 @@ class InferencePipeline:
 # =============================================================================
 def parse_args():
     parser = argparse.ArgumentParser(description='Microscopy inference + assembly')
-    parser.add_argument('--env', type=str, default=None, help='Environment name from env.json (e.g. GHCL10, runpod, docker, ...)')
-    parser.add_argument('--config', type=str, required=True, help='Config file name (without .yaml)')
-    parser.add_argument('--option', type=str, default=None, help='Option/dataset name in config (optional, overrides DEFAULT)')
+    parser.add_argument('--env', type=str, required=True, help='Environment name from env.yaml (e.g. Docker, GHCL00, ...)')
+    parser.add_argument('--scale', type=str, required=True, choices=['2x', '4x', '8x'], help='Scale config name from cfg/scale/')
+    parser.add_argument('--override', type=str, default=None, help='Override config file name in `cfg/` (without `.yaml`)')
     parser.add_argument('--cpu', action='store_true', help='Use CPU instead of GPU')
-    # CLI overrides for config values
-    parser.add_argument('--input_image_filename', type=str, default=None, help='Input image filename (overrides config)')
-    parser.add_argument('--output_dir_name', type=str, default=None, help='Output directory name (overrides config)')
-    parser.add_argument('--checkpoint_path', type=str, default=None, help='Checkpoint path relative to SOURCE (overrides config)')
-    parser.add_argument('--epoch', type=int, default=None, help='Model epoch (overrides config)')
-    return parser.parse_args()
+
+    args, cli_overrides = parser.parse_known_args()
+    args.cli_overrides = cli_overrides
+    return args
 
 
 def main():

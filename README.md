@@ -32,18 +32,21 @@ For a quick start, you can use our pre-built Docker image to run inference on ou
 
 ```
 TestingMicroscopyXX/
-├── test.py                # Main inference script
-├── run.sh                 # Execution examples
-├── requirements.txt       # Dependencies
-├── cfg/                   # Configuration files
-│   ├── env.json           # Environment settings
-│   ├── 2xSR.yaml          # 2x super-resolution config
-│   ├── 4xSR.yaml          # 4x super-resolution config
-│   └── 8xSR.yaml          # 8x super-resolution config
-├── models/                # Model definitions
-├── networks/              # Neural network architectures
-├── utils/                 # Utility modules
-└── ldm/                   # Latent Diffusion Model components
+├── test.py                  # Main inference script
+├── run.sh                   # Execution examples
+├── requirements.txt         # Dependencies
+├── cfg/                     # Configuration (OmegaConf / YAML)
+│   ├── base.yaml            # Default parameters
+│   ├── env.yaml             # Machine-specific path settings (DATASET, MODEL, RESULT)
+│   ├── scale/               # Scale-specific parameters overrides (patch_shape, zstep, downbranch)
+│   │   ├── 2x.yaml          # 2x super-resolution config
+│   │   ├── 4x.yaml          # 4x super-resolution config
+│   │   └── 8x.yaml          # 8x super-resolution config
+│   └── <experiment>.yaml    # Experiment-specific parameters overrides (paths, epochs, etc.)
+├── models/                  # Model definitions
+├── networks/                # Neural network architectures
+├── utils/                   # Utility modules
+└── ldm/                     # Latent Diffusion Model components (taming / VQ)
 ```
 
 ## Getting Started
@@ -68,141 +71,190 @@ TestingMicroscopyXX/
     pip install -r requirements.txt
     ```
 
-## Usage
+### Configuration
+
+Config is built by layered merging (OmegaConf): `base.yaml` → `scale/{2x,4x,8x}.yaml` → `env.yaml` → `<experiment>.yaml` → `CLI overrides`. Later layers override earlier ones.
+
+#### Environment (`cfg/env.yaml`)
+
+Different machines may store data, models, and results in different locations. Define a named environment for each machine and use `--env` to select one at runtime:
+
+```yaml
+Docker:
+  DATASET: "/workspace/data/"
+  MODEL: "/workspace/models/"
+  RESULT: "/workspace/results/"
+
+Machine00:
+  DATASET: "/path/to/Machine00/Data/"
+  MODEL: "/path/to/Machine00/Model/"
+  RESULT: "/path/to/Machine00/Result/"
+
+Machine01:
+  DATASET: "/path/to/Machine01/Data/"
+  MODEL: "/path/to/Machine01/Model/"
+  RESULT: "/path/to/Machine01/Result/"
+```
+
+#### Base config (`cfg/base.yaml`)
+
+Defines all available parameters and their default values. Later config layers can override any of these.
+
+**`patch`** — Patch dimensions
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `patch_shape` | `null` (Set by scale config) | Inference patch size `[Z, Y, X]` |
+| `upsample_size` | Same as `patch_shape` | Upsample target size for input patch before inference |
+
+**`assemble`** — Assembly parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `C` | `[16, 16, 16]` | Patch crop size (pixels) per side `[Z, Y, X]` |
+| `S` | `[16, 16, 16]` | Patch overlap size (pixels) for tapered blending `[Z, Y, X]` |
+| `weight_shape` | `[224, 224, 224]` | Tapered weight shape for blending (`patch_shape - 2*C`) |
+
+**`grid`** — Patch grid and ROI
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `testwhole` | `True` | `True`: process entire volume; `False`: crop to ROI first |
+| `roi.z/y/x` | `[0, 256]` / `[0, 1024]` / `[0, 1024]` | ROI range (only used when `testwhole: False`) |
+| `step.z` | `null` (Set by scale config) | Z-axis step size |
+| `step.y` | `13 * 16` | Y-axis step size |
+| `step.x` | `13 * 16` | X-axis step size |
+
+**`preprocess`** — Data preprocessing
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `norm_method` | `["00"]` | Normalization: `"00"` = as-is, `"01"` = 0–1, `"11"` = -1–1 |
+| `trd` | `[[0, 1000]]` | Intensity clipping `[lower, upper]` |
+| `norm_percentile` | `[0.1, 99.9]` | Percentile clipping range |
+
+**`model`** — Model settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `type` | `"VQQ2"` | Model type: `AE`, `GAN`, `VQQ2` |
+| `epoch` | `500` | Checkpoint epoch to load |
+| `hbranchz` | `true` | Use encoder posterior as h-branch input (VQQ2 only) |
+| `downbranch` | `null` (Set by scale config) | Downsampling factor. `1` for 8X SR, `2` for 4X SR, `4` for 2X SR |
+| `checking_codebook` | `true` | Log VQ codebook usage during inference (VQQ2 only) |
+| `decode_augmentation` | `false` | Apply augmentations during decoding |
+| `num_mc` | `1` | Number of Monte Carlo passes |
+| `tta_mode` | `"encode"` | Test-time augmentation stage: `encode` or `decode` |
+| `tta_method` | `[null, "transpose"]` | Test-time augmentation methods |
+| `fp16` | `false` | FP16 mixed-precision inference |
+
+**`output`** — Output settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `save` | `["ori", "xy"]` | Targets to save: `ori` (upsampled input), `xy` (enhanced) |
+| `output_format` | `"tiff"` | `tiff` (per-slice) or `zarr` (5D volume) |
+| `output_datatype` | `"float32"` | `float32`, `uint16`, `uint8` |
+| `output_channel` | `1` | Number of output channels |
+
+**`paths`** — Input/output paths (required, must be set by experiment config or CLI)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `input_img_relpath` | `null` | Input image path relative to `DATASET` |
+| `ckpt_relpath` | `null` | Checkpoint directory relative to `MODEL` |
+| `output_dir_name` | `null` | Output directory name under `RESULT` |
+
+Runtime paths (`input_img_path`, `ckpt_root_path`, `output_dir`) are built automatically via `os.path.join(env.*, paths.*)` in the code.
+
+#### Scale config (`cfg/scale/{2x,4x,8x}.yaml`)
+
+Sets scale-dependent parameters (`patch_shape`, `grid.step.z`, `model.downbranch`). 
+Example (`cfg/scale/2x.yaml`):
+
+```yaml
+patch:
+  patch_shape: [128, 256, 256]
+grid:
+  step:
+    z: 13 * 16 / 2
+model:
+  downbranch: 4
+```
+
+#### Experiment config (`cfg/<experiment>.yaml`)
+
+Override any parameter for a specific experiment. Use `--override <name>` to apply:
+
+```yaml
+grid:
+  testwhole: False
+  roi:
+    z: [0, 256]
+    y: [0, 2048]
+    x: [0, 2048]
+model:
+  epoch: 1700
+output:
+  output_datatype: "uint8"
+paths:
+  input_img_relpath: "THX10SDM20xw/roiDcrop2.tif"
+  ckpt_relpath: "THX10SDM20xw/max5skip4/checkpoints"
+  output_dir_name: "THX10SDM20xw"
+```
+
+#### CLI overrides
+
+Any parameter can be overridden directly from the command line using dot notation. CLI overrides are applied last, taking the highest priority:
+
+```bash
+python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.epoch=2000 paths.output_dir_name="THX10SDM20xw_epoch2000"
+```
+
+### Usage
 
 Run inference and assembly in one step. By default, all available GPUs on the device are used for inference. To specify which GPUs to use, set `CUDA_VISIBLE_DEVICES` (e.g., `CUDA_VISIBLE_DEVICES=0,2` to use GPU 0 and 2):
 
 ```bash
-# Uses all available GPUs by default
-python test.py --env GaryLab10 --config 4xSR --option filopodia
+# Use all available GPUs
+python test.py --env GHCL00 --scale 8x --override THX10SDM20xw
 
 # Use specific GPUs
-# CUDA_VISIBLE_DEVICES=0,1 python test.py --env GaryLab00 --config 4xSR --option filopodia
+CUDA_VISIBLE_DEVICES=0,1 python test.py --env GHCL00 --scale 8x --override THX10SDM20xw
 
-# Run on CPU
-# python test.py --env GaryLab00 --config 4xSR --option filopodia --cpu
+# Use CPU
+python test.py --env GHCL00 --scale 8x --override THX10SDM20xw --cpu
+
+# Override individual parameters via CLI
+python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.epoch=2000 paths.output_dir_name="THX10SDM20xw_epoch2000"
 ```
 
 **Arguments:**
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--config` | Config file name in `cfg/` (without `.yaml`) | required |
-| `--option` | Model section in config (overrides `DEFAULT`) | `None` |
-| `--env` | Environment name from `env.json` | `None` |
+| `--env` | Environment name from `env.yaml` (e.g. `Docker`, `GHCL00`) | required |
+| `--scale` | Scale config from `cfg/scale/` (`2x`, `4x`, `8x`) | required |
+| `--override` | Experiment config in `cfg/` (without `.yaml`) | `None` |
 | `--cpu` | Use CPU instead of GPU | off |
-| `--input_image_filename` | Input image filename (overrides config) | `None` |
-| `--output_dir_name` | Output directory name (overrides config) | `None` |
-| `--checkpoint_path` | Checkpoint path (overrides config) | `None` |
-| `--epoch` | Model epoch (overrides config) | `None` |
+| `key=value` | Additional CLI overrides (dot notation, e.g. `model.epoch=2000`) | — |
 
-### Configuration
+### Results
 
-#### Environment (`cfg/env.json`)
-
-Define named environments to set dataset, model, and result paths. Use `--env` to select one at runtime:
-
-```json
-{
-    "Docker": {
-        "DATASET": "/workspace/data/",
-        "MODEL": "/workspace/models/",
-        "RESULT": "/workspace/results/"
-    },
-    "GaryLab10": {
-        "DATASET": "/path/to/data/",
-        "MODEL": "/path/to/models/",
-        "RESULT": "/path/to/results/"
-    }
-}
-```
-
-#### YAML Config (`cfg/*.yaml`)
-
-YAML config files have two sections: `DEFAULT` (shared parameters) and an option section selected via `--option`:
-
-```yaml
-DEFAULT:
-  z_scale_ratio: 4                        # Z-axis scale factor (8 for 8X, 4 for 4X, 2 for 2X)
-  testwhole: True                         # process entire volume
-  upsample_params:
-    size: [64, 256, 256]                  # trilinear upsample target size
-  assemble_params:
-    C: [16, 16, 16]                       # crop margin per side (pixels)
-    S: [16, 16, 16]                       # overlap for tapered blending
-    patch_shape: [64, 256, 256]           # inference patch size (Z, Y, X)
-    weight_shape: [224, 224, 224]         # patch_shape - C * 2
-    zrange: [0, 256, 13 * 4]    # [start, end, step]
-    xrange: [0, 1024, 13 * 16]
-    yrange: [0, 1024, 13 * 16]
-    # If testwhole = True, only the step value matters
-
-  # image setting
-  norm_method: ["11"]                     # '00'=as-is, '01'=0-1, '11'=-1~1
-  trd: [[ None, None]]                    # intensity clipping thresholds [lower, upper]. [None, None] = no clipping
-  norm_percentile: [0.1, 99.9]            # percentile clipping range applied after normalization
-
-  # model setting
-  model_type: "VQQ2"                      # AE / GAN / VQQ2
-  epoch: 500                              # checkpoint epoch
-  hbranchz: true                          # use encoder posterior as h-branch input (VQQ2 only)
-  downbranch: 2                           # 1 for 8X SR, 2 for 4X SR, 4 for 2X SR
-  checking_codebook: true                 # log VQ codebook usage during inference (VQQ2 only)
-  decode_augmentation: false              # apply additional augmentations during decoding
-  mc: 1                                   # Monte Carlo passes
-  input_augmentation: [null, 'transpose'] # test-time augmentations
-  output_channel: 1                       # number of output channels
-
-  # pipeline settings
-  fp16: false                             # FP16 mixed-precision inference
-  augmentation: "encode"                  # augmentation stage: encode or decode
-  save: ["ori", "xy"]                     # targets: ori (upsampled input), xy (enhanced result)
-  output_format: "tiff"                   # tiff (per-slice) or zarr (5D volume)
-  output_datatype: "float32"              # float32, uint8, or uint16
-
-# use --option filopodia to select this section (overrides DEFAULT)
-filopodia:
-  input_image_filename: "input.tif"       # DATASET/input_image_filename
-  output_dir_name: "filopodia"       # RESULT/output_dir_name
-  checkpoint_path: "logs/filopodia/default/max10skip4/"   # MODEL/checkpoint_path
-
-  # any parameter defined here will override the same parameter in DEFAULT
-  # For example:
-  epoch: 1000
-  testwhole: False
-```
-
-**Note:** Parameters passed via CLI will override the YAML option section, and the option section will override default section. 
-
-## Workflow
-
-1. **Configure**: Create or select a YAML config file in `cfg/`
-2. **Run Inference**: Execute `run.sh` to inference and assembly in one step
-3. **Output**: Reconstructed 3D volumes (TIFF or Zarr)
-    - Supports uint8, uint16, float32 formats
-    - Save targets: `ori` (upsampled input), `xy`(model-enhanced result)
-    - Output formats: TIFF (per-slice) or Zarr (5D volume)
-    - Default viewing plane is YZ (TIFF saves one YZ slice per X position; Zarr stores X as the primary axis for the same view)
-    
-## Patch Grid Calculation
-
-The model takes input patches of size `(Z, Y, X) = (256/z_scale_ratio, 256, 256)` and outputs `(256, 256, 256)`. To avoid boundary artifacts, each output patch is cropped by `C` pixels on each side before assembly, resulting in a `(224, 224, 224)` cube. Each cropped patch is then multiplied by a tapered weight that decays toward the edges. Adjacent patches overlap by `S` pixels and are summed in the overlap region for seamless blending. 
-
-The figure below illustrates how the crop size `C` and overlap `S` determine the step size:
-
-![Patch Grid Calculation](assets/TestMicroscopyXX_Patch_Grid_Calculation.png)
-
-**Note:** The step size of `zrange` depends on the Z upscaling factor. If the Z dimension is upscaled by `k×`, the `zrange` step size becomes `1/k` times the `xrange` and `yrange` step size.
-
-## Viewing Zarr Output
-
-To view Zarr results in a web viewer (e.g. [Avivator](https://avivator.gehlenborglab.org/)), start a local HTTP server from the Zarr root directory:
-
-```bash
-# If the Zarr path is result/xxx.zarr:
-cd result
-npx http-server -p 8001 --cors='*'
-```
-
-Then open the Zarr data in Avivator using the URL: `http://localhost:8001/xxx.zarr`
+- Results will be saved to: `{RESULT}/{paths.output_dir_name}/`
+- The output directory contains
+  - `ori`: upsampled original image
+  - `xy`: model-enhanced image
+  - `config.yaml`: resolved config snapshot for reproducibility
+- Output is saved as YZ-plane slices along the X axis
+- Format (`output.output_format`): `tiff`, `zarr`
+- Datatype (`output.output_datatype`): `float32`, `uint16`, `uint8`
+- Viewing Zarr output: 
+  1. Start a local HTTP server from the Zarr root directory:
+      ```bash
+      # If the Zarr path is result/xxx.zarr
+      cd result
+      npx http-server -p 8001 --cors='*'
+      ```
+  2. Then open `http://localhost:8001/xxx.zarr` in [Avivator](https://avivator.gehlenborglab.org).
 

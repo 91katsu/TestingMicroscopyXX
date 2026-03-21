@@ -7,21 +7,14 @@
 # === Local ===
 
 # Use all available GPUs
-python test.py --env GaryLab10 --config 4xSR --option filopodia
+python test.py --env GHCL00 --scale 4x --override filopodia
+# python test.py --env GHCL00 --scale 8x --override THX10SDM20xw
 
 # Use specific GPUs
-# CUDA_VISIBLE_DEVICES=0,1 python test.py --env GaryLab10 --config 4xSR --option filopodia
+# CUDA_VISIBLE_DEVICES=0,1 python test.py --env GHCL00 --scale 8x --override THX10SDM20xw
 
 # Use CPU
-# python test.py --env GaryLab10 --config 4xSR --option filopodia --cpu
+# python test.py --env GHCL00 --scale 8x --override THX10SDM20xw --cpu
 
-# === Docker ===
-
-# docker run --gpus all \
-#   -v /path/to/your/local/data/path:/workspace/data \
-#   -v /path/to/your/local/models/path:/workspace/models \
-#   -v /path/to/your/local/results/path:/workspace/results \
-#   -v /path/to/your/local/cfg/xxx.yaml:/workspace/cfg/xxx.yaml \
-#   katsukuo/testing-microscopy:v3 \
-#   --config xxx \
-#   --option options_in_yaml
+# Use --override to select a yaml in cfg folder to override DEFAULT settings with a specific section in the YAML
+# python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.epoch=2000 paths.output_dir_name="THX10SDM20xw_epoch2000"
