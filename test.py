@@ -59,6 +59,9 @@ class Config:
         # Resolve all interpolations
         OmegaConf.resolve(cfg)
 
+        if cfg.paths.version is None:
+            cfg.paths.version = ''
+
         # Validate required paths
         required = ['input_img_relpath', 'ckpt_relpath', 'output_dir_name']
         missing = [k for k in required if OmegaConf.select(cfg, f'paths.{k}') is None]
@@ -68,7 +71,7 @@ class Config:
         # Build runtime paths with os.path.join (avoids double-slash issues)
         cfg.runtime = OmegaConf.create({
             'input_img_path': os.path.join(cfg.env.DATASET, cfg.paths.input_img_relpath),
-            'ckpt_root_path': os.path.join(cfg.env.MODEL, cfg.paths.ckpt_relpath),
+            'ckpt_root_path': os.path.join(cfg.env.MODEL, cfg.paths.ckpt_relpath, cfg.paths.version),
             'output_dir': os.path.join(cfg.env.RESULT, cfg.paths.output_dir_name),
         })
 
@@ -168,7 +171,7 @@ class ModelLoader:
 
     def _load_gan(self, ckpt_root_path, epoch):
         model_path = os.path.join(ckpt_root_path, f"net_g_model_epoch_{epoch}.pth")
-        return torch.load(model_path, map_location='cpu')
+        return torch.load(model_path, map_location='cpu', weights_only=False)
 
     def _load_vqq2(self, ckpt_root_path, epoch):
         return VQQModel(ckpt_root_path, epoch)
@@ -242,7 +245,7 @@ class ImageLoader:
         if crop_margin is not None:
             Cz, Cy, Cx = crop_margin
             z_ratio = self.cfg.scale
-            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//z_ratio, Cz//z_ratio), mode='constant', value=self.img.min())
+            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//z_ratio, Cz//z_ratio), mode='constant', value=self.img.mean())
             _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X) # (1, 1, 245, 2795, 2788)
             print(f"After C padding size (Z, Y, X): {self.img.shape}")
 
@@ -255,7 +258,7 @@ class ImageLoader:
         Nx = ((Dx // xstep) + 1) * xstep
 
         Pz, Py, Px = Nz - Dz, Ny - Dy, Nx - Dx
-        self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.min())
+        self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.mean())
         print(f"After stride padding size (Z, Y, X): {self.img.shape}")
 
         return self.img # (1, 1, Z, Y, X) # (1, 1, 260, 2912, 2912)
