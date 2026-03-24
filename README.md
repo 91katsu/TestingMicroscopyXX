@@ -49,6 +49,21 @@ TestingMicroscopyXX/
 └── ldm/                     # Latent Diffusion Model components (taming / VQ)
 ```
 
+### Checkpoint Structure
+
+```
+{MODEL}/{ckpt_relpath}/
+└── {version}/
+    ├── config.json
+    ├── {yaml_name}.yaml
+    ├── {models}.py
+    ├── encoder_model_epoch_{N}.pth
+    ├── decoder_model_epoch_{N}.pth
+    ├── net_g_model_epoch_{N}.pth
+    ├── quantize_model_epoch_{N}.pth
+    └── quant_conv_model_epoch_{N}.pth
+```
+
 ## Getting Started
 
 ### Requirements
@@ -164,6 +179,7 @@ Defines all available parameters and their default values. Later config layers c
 |-----------|---------|-------------|
 | `input_img_relpath` | `null` | Input image path relative to `DATASET` |
 | `ckpt_relpath` | `null` | Checkpoint directory relative to `MODEL` |
+| `version` | `null` | Version subdirectory under `ckpt_relpath` |
 | `output_dir_name` | `null` | Output directory name under `RESULT` |
 
 Runtime paths (`input_img_path`, `ckpt_root_path`, `output_dir`) are built automatically via `os.path.join(env.*, paths.*)` in the code.

@@ -45,4 +45,5 @@ output:
 paths:
   input_img_relpath: null      # required: override in experiment yaml or via CLI
   ckpt_relpath: null           # required: override in experiment yaml or via CLI
+  version: null
   output_dir_name: null        # required: override in experiment yaml or via CLI
