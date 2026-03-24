@@ -31,6 +31,7 @@ model:
   checking_codebook: true
   decode_augmentation: false
   num_mc: 1
+  mc_threshold: null              # threshold for binary MC std; null = raw std
   tta_mode: "encode"
   tta_method: [null, "transpose"]
   fp16: false

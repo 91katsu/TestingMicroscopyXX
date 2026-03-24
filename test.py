@@ -270,7 +270,9 @@ class PatchProcessor:
     def __init__(self, cfg, model_proc, upsample, device='cpu'):
         self.model_proc = model_proc
         self.upsample = upsample
-        self.tta_method = list(cfg.model.tta_method)
+        self.tta_method = list(cfg.model.tta_method) * cfg.model.num_mc
+        self.mc_threshold = cfg.model.mc_threshold
+        self.compute_xystd = 'xystd' in cfg.output.save
         self.fp16 = cfg.model.fp16
         self.device = torch.device(device)
         self.gpu = (self.device.type == 'cuda')
@@ -304,7 +306,10 @@ class PatchProcessor:
             outall[:, c, :, :, :] = (outall[:, c, :, :, :] - omin) / (omax - omin + 1e-6) * (xmax - xmin) + xmin
         # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
         # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
-        return outall, Xup
+        outstd = None
+        if self.compute_xystd:
+            outstd = ((outall > self.mc_threshold) / 1).std(axis=-1)  # binary MC std (Z, C, Y, X)
+        return outall, Xup, outstd
 
 
 # =============================================================================
@@ -317,7 +322,8 @@ class PatchAssembler:
         self.Sz, self.Sy, self.Sx = cfg.assemble.S
         self.weight_shape = list(cfg.assemble.weight_shape)
         self.output_format = cfg.output.output_format
-        self.output_datatype = cfg.output.output_datatype
+        self.target_name = target_name
+        self.output_datatype = 'uint8' if target_name == 'xystd' else cfg.output.output_datatype
         self.output_channel = cfg.output.output_channel
         self.zrange = zrange
         self.xrange = xrange
@@ -385,7 +391,11 @@ class PatchAssembler:
         self.zarr_out[0, :, self.current_x_position:self.current_x_position + x_len, :, :] = block
 
     def _convert_dtype(self, data):
-        """Convert float32 data (roughly -1 to 1 range) to target dtype."""
+        """Convert float32 data to target dtype."""
+        if self.target_name == 'xystd':
+            dmin, dmax = data.min(), data.max()
+            data = (data - dmin) / (dmax - dmin + 1e-6) * 255
+            return data.astype(np.uint8)
         if self.output_datatype == 'uint8':
             return np.clip((data + 1) * 127.5, 0, 255).astype(np.uint8)
         elif self.output_datatype == 'uint16':
@@ -523,6 +533,10 @@ class InferencePipeline:
         print(OmegaConf.to_yaml(self.cfg))
         print("=" * 50)
 
+        # Validate MC config
+        if self.cfg.model.num_mc > 1 and self.cfg.model.mc_threshold is None:
+            raise ValueError("num_mc > 1 requires mc_threshold to be set (note that mc_threshold is float, range is [-1, 1])")
+
         # Setup output directory
         self.dest = self.cfg.runtime.output_dir
         self._setup_output_dirs()
@@ -635,13 +649,16 @@ class InferencePipeline:
                     # Collect results (order doesn't matter for store_patch)
                     for fut in as_completed(futures):
                         nz, ny = futures[fut]
-                        outall, Xup = fut.result()
+                        outall, Xup, outstd = fut.result()
                         # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
                         # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
+                        # outstd: (Z, C, Y, X) # (256, 1, 256, 256) MC std
                         if 'xy' in assemblers:
                             assemblers['xy'].store_patch(nz, ny, outall, is_outall=True)
                         if 'ori' in assemblers:
                             assemblers['ori'].store_patch(nz, ny, Xup, is_outall=False)
+                        if 'xystd' in assemblers:
+                            assemblers['xystd'].store_patch(nz, ny, outstd, is_outall=False)
                         pbar.update(1)
 
                     # Snapshot patches and reset — so next column can store immediately

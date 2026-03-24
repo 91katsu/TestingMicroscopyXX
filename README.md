@@ -143,7 +143,8 @@ Defines all available parameters and their default values. Later config layers c
 | `downbranch` | `null` (Set by scale config) | Downsampling factor. `1` for 8X SR, `2` for 4X SR, `4` for 2X SR |
 | `checking_codebook` | `true` | Log VQ codebook usage during inference (VQQ2 only) |
 | `decode_augmentation` | `false` | Apply augmentations during decoding |
-| `num_mc` | `1` | Number of Monte Carlo passes |
+| `num_mc` | `1` | Number of Monte Carlo passes (repeats `tta_method` list `num_mc` times) |
+| `mc_threshold` | `null` | Threshold for binary MC std map. Required when `num_mc > 1` |
 | `tta_mode` | `"encode"` | Test-time augmentation stage: `encode` or `decode` |
 | `tta_method` | `[null, "transpose"]` | Test-time augmentation methods |
 | `fp16` | `false` | FP16 mixed-precision inference |
@@ -152,7 +153,7 @@ Defines all available parameters and their default values. Later config layers c
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `save` | `["ori", "xy"]` | Targets to save: `ori` (upsampled input), `xy` (enhanced) |
+| `save` | `["ori", "xy"]` | Targets to save: `ori` (upsampled input), `xy` (enhanced result), `xystd` (MC uncertainty map, uint8) |
 | `output_format` | `"tiff"` | `tiff` (per-slice) or `zarr` (5D volume) |
 | `output_datatype` | `"float32"` | `float32`, `uint16`, `uint8` |
 | `output_channel` | `1` | Number of output channels |
@@ -242,10 +243,11 @@ python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.epoch=2000 
 ### Results
 
 - Results will be saved to: `{RESULT}/{paths.output_dir_name}/`
-- The output directory contains
+- The output directory contains the targets specified in `output.save`:
   - `ori`: upsampled original image
   - `xy`: model-enhanced image
-  - `config.yaml`: resolved config snapshot for reproducibility
+  - `xystd`: Monte Carlo uncertainty map (uint8)
+  - `config.yaml`: resolved config snapshot (always saved)
 - Output is saved as YZ-plane slices along the X axis
 - Format (`output.output_format`): `tiff`, `zarr`
 - Datatype (`output.output_datatype`): `float32`, `uint16`, `uint8`
@@ -258,3 +260,6 @@ python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.epoch=2000 
       ```
   2. Then open `http://localhost:8001/xxx.zarr` in [Avivator](https://avivator.gehlenborglab.org).
 
+## Monte Carlo Uncertainty Estimation
+
+If you need Monte Carlo uncertainty boundary maps, see [here](monte_carlo.md) for usage instructions.
