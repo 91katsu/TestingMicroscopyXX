@@ -26,6 +26,7 @@ preprocess:
 model:
   type: "VQQ2"
   epoch: 500
+  batch_size: 1               # number of patches per forward pass
   hbranchz: true
   downbranch: null             # overridden by cfg/scale/{2x,4x,8x}.yaml
   checking_codebook: true
@@ -37,7 +38,7 @@ model:
   fp16: false
 
 output:
-  save: ["ori", "xy"]
+  save: ["ori", "xy"]     
   output_format: "tiff"
   output_datatype: "float32"
   output_channel: 1

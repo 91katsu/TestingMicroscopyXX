@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import tifffile as tiff
 from omegaconf import OmegaConf
 import zarr
+from ome_zarr.writer import write_multiscales_metadata
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -15,17 +16,15 @@ from utils.model_utils import read_json_to_args, import_model, load_pth, ModelPr
 from utils.data_utils import DataNormalization
 
 import taming.modules.vqvae.quantize as q
-
 if not hasattr(q, "VectorQuantizer2"):
     if hasattr(q, "VectorQuantizer"):
         q.VectorQuantizer2 = q.VectorQuantizer
-
 
 # =============================================================================
 # Config
 # =============================================================================
 class Config:
-    """Layered OmegaConf config: base -> scale -> env -> override -> cli."""
+    """Layered OmegaConf config: base → scale → env → overrisde → cli."""
 
     def __init__(self, scale=None, env=None, override=None, cli_overrides=None):
         # 1. Load base config
@@ -85,18 +84,12 @@ class VQQModel:
     """Container for VQQ2 model components."""
 
     def __init__(self, ckpt, epoch):
-        self.encoder = torch.load(os.path.join(ckpt, f"encoder_model_epoch_{epoch}.pth"), map_location='cpu',
-                                  weights_only=False)
-        self.decoder = torch.load(os.path.join(ckpt, f"decoder_model_epoch_{epoch}.pth"), map_location='cpu',
-                                  weights_only=False)
-        self.net_g = torch.load(os.path.join(ckpt, f"net_g_model_epoch_{epoch}.pth"), map_location='cpu',
-                                weights_only=False)
-        self.quantize = torch.load(os.path.join(ckpt, f"quantize_model_epoch_{epoch}.pth"), map_location='cpu',
-                                   weights_only=False)
-        self.quant_conv = torch.load(os.path.join(ckpt, f"quant_conv_model_epoch_{epoch}.pth"), map_location='cpu',
-                                     weights_only=False)
-        self.post_quant_conv = torch.load(os.path.join(ckpt, f"post_quant_conv_model_epoch_{epoch}.pth"),
-                                          map_location='cpu', weights_only=False)
+        self.encoder = torch.load(os.path.join(ckpt, f"encoder_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.decoder = torch.load(os.path.join(ckpt, f"decoder_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.net_g = torch.load(os.path.join(ckpt, f"net_g_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.quantize = torch.load(os.path.join(ckpt, f"quantize_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.quant_conv = torch.load(os.path.join(ckpt, f"quant_conv_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
+        self.post_quant_conv = torch.load(os.path.join(ckpt, f"post_quant_conv_model_epoch_{epoch}.pth"), map_location='cpu', weights_only=False)
 
     def to(self, device):
         for attr in ['encoder', 'decoder', 'net_g', 'quantize', 'quant_conv', 'post_quant_conv']:
@@ -126,7 +119,7 @@ class ModelLoader:
         self.gpu = (self.device.type == 'cuda')
 
         self.model = self._load_model()
-        self.upsample = torch.nn.Upsample(size=list(cfg.patch.upsample_size), mode='trilinear')
+        self.upsample = torch.nn.Upsample(size=list(self.cfg.patch.upsample_size), mode='trilinear')
 
         if self.gpu:
             self.upsample = self.upsample.to(self.device)
@@ -194,18 +187,27 @@ class ImageLoader:
         self.normalizer = DataNormalization(backward_type='float32')
         self.img = None
 
-    def load(self):
+    def load_3d_img(self):
         image_path = self.cfg.runtime.input_img_path
         print("=" * 50)
         print(f"Loading image from: {image_path}")
-        nvtx.range_push("disk::load_image")
-        self.img = tiff.imread(image_path)  # (Z, Y, X) # (237, 2763, 2756)
-        nvtx.range_pop()
+        self.img = tiff.imread(image_path) # (Z, Y, X) # (237, 2763, 2756)
+        return self.img
+
+    def apply_forward_norm(self):
+        if self.img is None:
+            raise ValueError("Image not loaded. Call load_3d_img() first.")
+        print("Applying forward normalization...")
+        
+        self.img = self.normalizer.forward_normalization(
+            self.img, self.cfg.preprocess.norm_method[0], self.cfg.preprocess.trd[0]
+        ) # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
         return self.img
 
     def apply_percentile_norm(self):
         if self.img is None:
-            raise ValueError("Image not loaded. Call load() first.")
+            raise ValueError("Image not loaded. Call load_3d_img() first.")
+        print("Applying percentile normalization...")
 
         norm_pct = self.cfg.preprocess.norm_percentile
         if norm_pct is not False:
@@ -221,52 +223,51 @@ class ImageLoader:
             self.img = (self.img - xmin) / (xmax - xmin)
             self.img = self.img * 2 - 1
 
-        return self.img  # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
+        return self.img # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
 
-    def cropROI(self, zrange, yrange, xrange):
+    def crop_roi(self, zrange, yrange, xrange):
         """Crop image to specified range (used when testwhole=False)."""
         if self.img is None:
-            raise ValueError("Image not loaded. Call load() first.")
+            raise ValueError("Image not loaded. Call load_3d_img() first.")
         self.img = self.img[:, :, zrange[0]:zrange[1], yrange[0]:yrange[1], xrange[0]:xrange[1]]
         print(f"Cropped to {self.img.shape}")
         return self.img
 
-    def pad(self, crop_margin=None):
+    def pad(self, patch_shape, crop_margin=None):
         """
         Pad image for patch-based inference.
 
         Args:
             crop_margin: (Cz, Cy, Cx) pixels cropped from each side during assembly.
-                         If provided, pads by C on both sides to preserve original size.
+                        If provided, pads by C on both sides to preserve original size.
         """
         print("=" * 50)
         if self.img is None:
-            raise ValueError("Image not loaded. Call load() first.")
-
-        _, _, Dz, Dy, Dx = self.img.shape  # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
+            raise ValueError("Image not loaded. Call load_3d_img() first.")
+        dz, dy, dx = patch_shape
+        _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X)
         print(f"Original size (Z, Y, X): ({Dz}, {Dy}, {Dx})")
 
         # First, pad by crop margin (C) on both sides to preserve original size after assembly
         if crop_margin is not None:
             Cz, Cy, Cx = crop_margin
             z_ratio = self.cfg.scale
-            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz // z_ratio, Cz // z_ratio), mode='constant',
-                             value=self.img.min())
-            _, _, Dz, Dy, Dx = self.img.shape  # (1, 1, Z, Y, X) # (1, 1, 245, 2795, 2788)
-            print(f"After C padding size (Z, Y, X): {self.img.shape}")
+            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//z_ratio, Cz//z_ratio), mode='constant', value=self.img.min())
+            _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X)
+            print(f"After C padding size (Z, Y, X): {(self.img.shape[2], self.img.shape[3], self.img.shape[4])}")
 
         zstep = int(eval(str(self.cfg.grid.step.z)))
         ystep = int(eval(str(self.cfg.grid.step.y)))
         xstep = int(eval(str(self.cfg.grid.step.x)))
-        # Then pad to make divisible by patch shape
-        Nz = ((Dz // zstep) + 1) * zstep
-        Ny = ((Dy // ystep) + 1) * ystep
-        Nx = ((Dx // xstep) + 1) * xstep
 
+        Nz = (Dz // zstep) * zstep + dz
+        Ny = (Dy // ystep) * ystep + dy
+        Nx = (Dx // xstep) * xstep + dx
         Pz, Py, Px = Nz - Dz, Ny - Dy, Nx - Dx
         self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.min())
-        print(f"After stride padding size (Z, Y, X): {self.img.shape}")
-        return self.img  # (1, 1, Z, Y, X) # (1, 1, 260, 2912, 2912)
+        print(f"After stride padding size (Z, Y, X): {(self.img.shape[2], self.img.shape[3], self.img.shape[4])}")
+
+        return self.img # (1, 1, Z, Y, X)
 
 
 # =============================================================================
@@ -285,49 +286,48 @@ class PatchProcessor:
         self.device = torch.device(device)
         self.gpu = (self.device.type == 'cuda')
 
-    def run(self, x0_list, startIdx_zyx, patchShape_zyx, ii=None):
-        # Extract and upsample patch
-        # x0_list is on CPU, slice then move to this worker's device
-        # (B, C, Z, Y, X) # (1, 1, 64, 256, 256)
-        patch = [x[:, :, startIdx_zyx[0]:startIdx_zyx[0] + patchShape_zyx[0], startIdx_zyx[1]:startIdx_zyx[1] +
-                                                                                              patchShape_zyx[1],
-        startIdx_zyx[2]:startIdx_zyx[2] + patchShape_zyx[2]] for x in x0_list]
-        # Move to this worker's device for upsample
-        nvtx.range_push("mem::ram_to_vram")
-        patch = [x.to(self.device) for x in patch]
-        nvtx.range_pop()
-        # (Z, C, Y, X) # (64, 1, 256, 256)
-        nvtx.range_push("gpu::inference")
-        patch = torch.cat([self.upsample(x).squeeze().unsqueeze(1) for x in patch], 1)
+    def run(self, imgs, start_index, patch_shape, ii=None):
+        """Run inference on a batch of patches using get_vqq_out_batch.
+
+        Args:
+            start_index: list of [iz, iy, ix] starts, length B.
+
+        Returns:
+            list of B tuples (xy_patch, Xup, None)
+        """
+        B = len(start_index)
+        pz, py, px = patch_shape
+
+        per_channel = []
+        for img in imgs:
+            patch = [img[:, :, si[0]:si[0]+pz, si[1]:si[1]+py, si[2]:si[2]+px] for si in start_index]
+            batch_patch = torch.cat(patch, dim=0)
+            nvtx.range_push("mem::ram_to_vram")
+            batch_patch = batch_patch.to(self.device)
+            torch.cuda.synchronize(self.device)
+            nvtx.range_pop()  # mem::ram_to_vram
+            per_channel.append(self.upsample(batch_patch))
+
+        batch_input = torch.cat(per_channel, dim=1)
 
         if self.fp16 and self.gpu:
-            patch = patch.half()
-            with torch.cuda.amp.autocast():
-                _, Xup, outall, _ = self.model_proc.get_model_result(patch, self.tta_method, ii=ii)
+            batch_input = batch_input.half() # (B, C, Z, Y, X)
+            with torch.amp.autocast('cuda'):
+                XupX, Xup, _ = self.model_proc.get_vqq_out_batch_nvtx(
+                    batch_input, self.tta_method, ii=ii)
         else:
-            # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
-            # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
-            _, Xup, outall, _ = self.model_proc.get_model_result(patch, self.tta_method, ii=ii)
-        nvtx.range_pop()
+            XupX, Xup, _ = self.model_proc.get_vqq_out_batch_nvtx(
+                batch_input, self.tta_method, ii=ii)
+        # XupX: (B, Z, C, X, Y) — already normalized mean, CPU
+        # Xup:  (B, Z, C, X, Y) — CPU
 
-        nvtx.range_push("mem::vram_to_ram")
-        outall = outall.numpy().astype(np.float32)  # (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
-        Xup = Xup.numpy().astype(np.float32)  # (Z, C, Y, X) # (256, 1, 256, 256)
-        nvtx.range_pop()
+        XupX = XupX.numpy().astype(np.float32)
+        Xup = Xup.numpy().astype(np.float32)
 
-        # Match output range to input range per channel
-        nvtx.range_push("cpu::postprocess")
-        for c in range(outall.shape[1]):
-            omin, omax = outall[:, c, :, :, :].min(), outall[:, c, :, :, :].max()
-            xmin, xmax = Xup[:, c, :, :].min(), Xup[:, c, :, :].max()
-            outall[:, c, :, :, :] = (outall[:, c, :, :, :] - omin) / (omax - omin + 1e-6) * (xmax - xmin) + xmin
-        # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
-        # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
-        outstd = None
-        if self.compute_xystd:
-            outstd = ((outall > self.mc_threshold) / 1).std(axis=-1)  # binary MC std (Z, C, Y, X)
-        nvtx.range_pop()
-        return outall, Xup, outstd
+        results = []
+        for b in range(B):
+            results.append((XupX[b], Xup[b], None))
+        return results
 
 
 # =============================================================================
@@ -350,6 +350,7 @@ class PatchAssembler:
         self.patches = {}
         self.last_block = None
         self.current_x_position = 0
+        self._weight_cache = {}
 
         # Setup output
         self.output_path = os.path.join(cfg.runtime.output_dir, target_name + '_assemble')
@@ -366,13 +367,13 @@ class PatchAssembler:
             os.makedirs(d, exist_ok=True)
 
     def _init_zarr_store(self):
-        wZ, wX, wY = self.weight_shape
+        Wz, Wy, Wx = self.weight_shape
         nz = len(self.zrange)
         ny = len(self.yrange)
         nx = len(self.xrange)
-        fZ = int(wZ * nz - (nz - 1) * self.Sz)
-        fY = int(wY * ny - (ny - 1) * self.Sy)
-        fX = int(wX * nx - (nx - 1) * self.Sx - self.Sx)
+        fZ = int(Wz * nz - self.Sz * (nz - 1))
+        fY = int(Wy * ny - self.Sy * (ny - 1))
+        fX = int(Wx * nx - self.Sx * (nx - 1) - self.Sx)
 
         save_dtype = np.dtype(self.output_datatype)
 
@@ -386,10 +387,51 @@ class PatchAssembler:
         self.zarr_out = root.create_dataset(
             "0", shape=shape_5d, chunks=chunks_5d, dtype=save_dtype, fill_value=0
         )
+        # Force creation of 0/.zattrs — Avivator fetches it and 404s if missing
+        self.zarr_out.attrs.put({})
+        self._write_ome_metadata(root)
         self.zarr_path = zarr_path
         print(f"[zarr] Created store: {zarr_path}, shape TCZYX={shape_5d}")
 
-    def _write_column_tiff(self, one_zy_block, Sx):
+    def _write_ome_metadata(self, root):
+        """Write OME-NGFF v0.4 metadata so viewers (Avivator, napari, vizarr)
+        can read the zarr. Axes order matches array shape (T, C, Z, Y, X)."""
+        write_multiscales_metadata(
+            group=root,
+            datasets=[{
+                "path": "0",
+                "coordinateTransformations": [
+                    {"type": "scale", "scale": [1.0, 1.0, 1.0, 1.0, 1.0]}
+                ],
+            }],
+            axes=[
+                {"name": "t", "type": "time"},
+                {"name": "c", "type": "channel"},
+                {"name": "z", "type": "space", "unit": "pixel"},
+                {"name": "y", "type": "space", "unit": "pixel"},
+                {"name": "x", "type": "space", "unit": "pixel"},
+            ],
+            name=f"{self.target_name}_sideview_YZ",
+        )
+
+        # omero block — default contrast window for viewers
+        if self.target_name == 'xystd' or self.output_datatype == 'uint8':
+            wmin, wmax = 0.0, 255.0
+        elif self.output_datatype == 'uint16':
+            wmin, wmax = 0.0, 65535.0
+        else:  # float32, model output is roughly [-1, 1]
+            wmin, wmax = -1.0, 1.0
+        root.attrs["omero"] = {
+            "channels": [{
+                "label": f"ch{c}",
+                "color": "FFFFFF",
+                "window": {"min": wmin, "max": wmax, "start": wmin, "end": wmax},
+                "active": True,
+            } for c in range(self.output_channel)],
+            "rdefs": {"defaultT": 0, "defaultZ": 0, "model": "greyscale"},
+        }
+
+    def _write_column_tiff(self, one_zy_block, Sx, x_position):
         """Write assembled column as per-X-position TIFF slices."""
         for x in range(0, one_zy_block.shape[1] - Sx):
             for c in range(one_zy_block.shape[0]):
@@ -397,16 +439,16 @@ class PatchAssembler:
                 slice_data = self._convert_dtype(slice_data)
                 tiff.imwrite(
                     os.path.join(self.output_path + '_' + str(c),
-                                 'slice_x_' + str(self.current_x_position + x).zfill(4) + '.tif'),
+                                 'slice_x_' + str(x_position + x).zfill(4) + '.tif'),
                     slice_data
                 )
 
-    def _write_column_zarr(self, one_zy_block, Sx):
+    def _write_column_zarr(self, one_zy_block, Sx, x_position):
         """Write assembled column block to zarr store."""
         block = one_zy_block[:, :one_zy_block.shape[1] - Sx, :, :]
         block = self._convert_dtype(block)
         x_len = block.shape[1]
-        self.zarr_out[0, :, self.current_x_position:self.current_x_position + x_len, :, :] = block
+        self.zarr_out[0, :, x_position:x_position + x_len, :, :] = block
 
     def _convert_dtype(self, data):
         """Convert float32 data to target dtype."""
@@ -420,61 +462,63 @@ class PatchAssembler:
             return np.clip((data + 1) * 32767.5, 0, 65535).astype(np.uint16)
         return data.astype(np.float32)
 
-    def _create_tapered_weight(self, Sz, Sy, Sx, nz, ny, nx, size, edge_size: int = 64) -> np.ndarray:
-        """Create a 3D cube with linearly tapered edges in all directions.
-
-        Weight axes: 0 -> Z (tapered by Sz), 1 -> (tapered by Sy), 2 -> (tapered by Sx).
-
-                Edge flags: 0 = first patch (no taper on leading edge),
-                -1 = last patch (no taper on trailing edge).
+    def _create_tapered_weight(self, nz_flag, ny_flag, nx_flag) -> np.ndarray:
+        """Cached tapered weight. Boundary states per axis collapse to 3 cases
+        (first / last / middle), so at most 27 weight arrays are materialized.
         """
-        weight = np.ones(size)
+        # Normalize middle indices (anything not 0 or -1) to a single key
+        def _state(f):
+            if f == 0 or f == -1:
+                return f
+            return 'M'
+        key = (_state(nz_flag), _state(ny_flag), _state(nx_flag))
+        cached = self._weight_cache.get(key)
+        if cached is not None:
+            return cached
 
-        taper_Sz = np.linspace(0, 1, Sz)
-        taper_Sy = np.linspace(0, 1, Sy)
-        taper_Sx = np.linspace(0, 1, Sx)
-        # Z
-        if nz != 0:
+        Sz, Sy, Sx = self.Sz, self.Sy, self.Sx
+        weight = np.ones(self.weight_shape, dtype=np.float32)
+        taper_Sz = np.linspace(0, 1, Sz, dtype=np.float32)
+        taper_Sy = np.linspace(0, 1, Sy, dtype=np.float32)
+        taper_Sx = np.linspace(0, 1, Sx, dtype=np.float32)
+        nz_k, ny_k, nx_k = key
+        if nz_k != 0:
             weight[:Sz, :, :] *= taper_Sz.reshape(-1, 1, 1)
-        if nz != -1:
+        if nz_k != -1:
             weight[-Sz:, :, :] *= taper_Sz[::-1].reshape(-1, 1, 1)
-        # Y
-        if ny != 0:
+        if ny_k != 0:
             weight[:, :Sy, :] *= taper_Sy.reshape(1, -1, 1)
-        if ny != -1:
+        if ny_k != -1:
             weight[:, -Sy:, :] *= taper_Sy[::-1].reshape(1, -1, 1)
-        # X
-        if nx != 0:
+        if nx_k != 0:
             weight[:, :, :Sx] *= taper_Sx.reshape(1, 1, -1)
-        if nx != -1:
+        if nx_k != -1:
             weight[:, :, -Sx:] *= taper_Sx[::-1].reshape(1, 1, -1)
 
+        weight.setflags(write=False)
+        self._weight_cache[key] = weight
         return weight
-
-    def store_patch(self, nz, ny, data, is_outall=False):
+    
+    def store_patch(self, nz, ny, data, aug_dim_avg=False):
         """Store a patch for the current X loop.
 
         Args:
             nz, ny: grid indices within current X loop
-            data: outall (Z,C,Y,X,aug) if is_outall, else Xup (Z,C,Y,X)
+            data: outall (C, Z, Y, X, aug) if is_outall, else Xup (C, Z, Y, X)
             is_outall: True if data has augmentation dimension to average
         """
-        if is_outall:
-            data = data.mean(axis=-1)  # average augmentations => (Z, C, Y, X, aug) -> (Z, C, Y, X)
-        patch = np.transpose(data, (1, 0, 2, 3)).astype(np.float32)  # (C, Z, Y, X)
+        if aug_dim_avg:
+            data = data.mean(axis=-1)  # average augmentations => (C, Z, Y, X, aug) -> (C, Z, Y, X)
+        patch = data.astype(np.float32)  # (C, Z, Y, X)
         self.patches[(nz, ny)] = patch
 
-    def assemble_column(self, nx, patches=None):
+    def assemble_column(self, nx, patches=None, write_executor=None):
         """Assemble all patches for X-column index nx and write output.
 
-        Args:
-            nx: X-column index.
-            patches: dict of {(nz, ny): patch_array}. If None, uses self.patches.
-
-        Uses zarr version's axis convention:
-        - Inner loop (ny): blend along Y (axis 3 of CZXY)
-        - Middle loop (nz): blend along Z (axis 2 after transpose to CXZY)
-        - Outer (nx): blend along X (axis 1) via last_block
+        If `write_executor` is provided, the disk write is dispatched to it
+        (non-blocking) so the next column's assemble can start immediately.
+        `last_block` / `current_x_position` are updated before dispatch so the
+        next column's assemble sees the correct state.
         """
         nvtx.range_push("cpu::assemble")
         if patches is None:
@@ -489,7 +533,7 @@ class PatchAssembler:
         for nz in range(nz_count):
             one_column = []
             for ny in range(ny_count):
-                # Edge flags:
+                # Edge flags: 
                 # 0 = first patch, -1 = last patch
                 nz_flag = -1 if nz == nz_count - 1 else nz
                 nx_flag = -1 if nx == nx_count - 1 else nx
@@ -497,12 +541,10 @@ class PatchAssembler:
 
                 # Get patch and crop margins from all sides
                 patch = patches[(nz, ny)]  # (C, Z, X, Y) # (1, 256, 256, 256)
-                cropped = patch[:, Cz:-Cz, Cy:-Cy, Cx:-Cx]  # (C, Z, X, Y) # (1, 224, 224, 224)
+                cropped = patch[:, Cz:-Cz, Cy:-Cy, Cx:-Cx] # (C, Z, X, Y) # (1, 224, 224, 224)
 
-                w = self._create_tapered_weight(Sz, Sy, Sx, nz_flag, ny_flag, nx_flag,
-                                                size=self.weight_shape)
-                w = np.stack([w] * cropped.shape[0], axis=0)
-                cropped = np.multiply(cropped, w)  # (C, Z, X, Y) # (1, 224, 224, 224)
+                w = self._create_tapered_weight(nz_flag, ny_flag, nx_flag)
+                cropped = cropped * w  # broadcast (Z,Y,X) over C → (C,Z,Y,X)
 
                 # Y-axis blending: overlap Sy along axis 2
                 if len(one_column) > 0:
@@ -522,25 +564,32 @@ class PatchAssembler:
             else:
                 one_zy_block.append(one_column)
 
-        one_zy_block = np.concatenate(one_zy_block, axis=2).astype(np.float32)  # (C, X, Z_total, Y_total)
+        one_zy_block = np.concatenate(one_zy_block, axis=2)  # (C, X, Z_total, Y_total) float32
 
         # X-axis blending: overlap Sx along axis 1
         if self.last_block is not None:
             one_zy_block[:, :Sx, :, :] += self.last_block
-
         nvtx.range_pop()  # cpu::assemble
 
-        # Write output (excluding the trailing Sx overlap)
-        nvtx.range_push("disk::write_output")
-        if self.output_format == 'tiff':
-            self._write_column_tiff(one_zy_block, Sx)
-        elif self.output_format == 'zarr':
-            self._write_column_zarr(one_zy_block, Sx)
-        nvtx.range_pop()
-
-        # Save overlap for next column
+        # Snapshot write position, then update state BEFORE dispatching write
+        # so the next column's assemble can start immediately with correct state.
+        write_x_position = self.current_x_position
         self.last_block = one_zy_block[:, -Sx:, :, :].copy()
         self.current_x_position += one_zy_block.shape[1] - Sx
+
+        # Dispatch write (sync or async)
+        def _write2disk():
+            nvtx.range_push("disk::write_output")
+            if self.output_format == 'tiff':
+                self._write_column_tiff(one_zy_block, Sx, write_x_position)
+            elif self.output_format == 'zarr':
+                self._write_column_zarr(one_zy_block, Sx, write_x_position)
+            nvtx.range_pop()  # disk::write_output
+
+        if write_executor is not None:
+            write_executor.submit(_write2disk)
+        else:
+            _write2disk()
 
 
 # =============================================================================
@@ -559,8 +608,7 @@ class InferencePipeline:
 
         # Validate MC config
         if self.cfg.model.num_mc > 1 and self.cfg.model.mc_threshold is None:
-            raise ValueError(
-                "num_mc > 1 requires mc_threshold to be set (note that mc_threshold is float, range is [-1, 1])")
+            raise ValueError("num_mc > 1 requires mc_threshold to be set (note that mc_threshold is float, range is [-1, 1])")
 
         # Setup output directory
         self.dest = self.cfg.runtime.output_dir
@@ -598,41 +646,49 @@ class InferencePipeline:
 
     def _get_patch_grid(self, img_shape):
         _, _, z, y, x = img_shape
-
+        pz, py, px = self.cfg.patch.patch_shape
         zstep = int(eval(str(self.cfg.grid.step.z)))
         ystep = int(eval(str(self.cfg.grid.step.y)))
         xstep = int(eval(str(self.cfg.grid.step.x)))
 
-        return range(0, z, zstep), range(0, y, ystep), range(0, x, xstep)
+        zend = (z - pz) + zstep
+        yend = (y - py) + ystep
+        xend = (x - px) + xstep
+
+        return range(0, int(zend), zstep), range(0, int(yend), ystep), range(0, int(xend), xstep)
 
     def run(self):
         # Load and preprocess image
-        self.image_loader.load()  # (Z, Y, X) # (237, 2763, 2756)
+        nvtx.range_push("disk::load_image")
+        self.image_loader.load_3d_img() # (Z, Y, X) # (237, 2763, 2756)
+        nvtx.range_pop()
+        
         nvtx.range_push("cpu::preprocess")
-        self.image_loader.img = self.image_loader.normalizer.forward_normalization(
-            self.image_loader.img, self.cfg.preprocess.norm_method[0], self.cfg.preprocess.trd[0]
-        )  # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
-        self.image_loader.apply_percentile_norm()  # (B, C, Z, Y, X) # (1, 1, 237, 2763, 2756)
-        patch_shape = list(self.cfg.patch.patch_shape)
-        dz, dy, dx = patch_shape
+        self.image_loader.apply_forward_norm() # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
+        self.image_loader.apply_percentile_norm() # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
 
-        crop_margin = list(self.cfg.assemble.C)
+        crop_margin = self.cfg.assemble.C
         # When testwhole=False, crop image to specified range first
         if not self.cfg.grid.testwhole:
             zr = list(self.cfg.grid.roi.z)
             yr = list(self.cfg.grid.roi.y)
             xr = list(self.cfg.grid.roi.x)
-            self.image_loader.cropROI(zr, yr, xr)
+            self.image_loader.crop_roi(zr, yr, xr)
             crop_margin = None
 
-        self.image_loader.pad(crop_margin=crop_margin)  # (B, C, Z, Y, X) # (1, 1, 260, 2912, 2912)
-        nvtx.range_pop()
-        x0 = [self.image_loader.img]
+        patch_shape = self.cfg.patch.patch_shape
+        self.image_loader.pad(patch_shape=patch_shape, crop_margin=crop_margin) # (B, C, Z, Y, X) # (1, 1, 260, 2912, 2912)
+        imgs = [self.image_loader.img]
 
+        nvtx.range_pop()  # cpu::preprocess
+        
         # Get patch grid
         zrange, yrange, xrange = self._get_patch_grid(self.image_loader.img.shape)
         total_patches = len(zrange) * len(yrange) * len(xrange)
         print("=" * 50)
+        print('zrange:', zrange)
+        print('yrange:', yrange)
+        print('xrange:', xrange)
         print(f"Processing {len(zrange)}x{len(yrange)}x{len(xrange)} = {total_patches} patches")
 
         # Create one assembler per save target
@@ -643,55 +699,54 @@ class InferencePipeline:
                 target_name=target,
                 zrange=zrange, xrange=xrange, yrange=yrange
             )
-
-        print('xrange:', xrange)
-        print('zrange:', zrange)
-        print('yrange:', yrange)
-        print("=" * 50)
-        print("Starting inference and assembly...")
-
         # Build list of (nz, ny, iz, iy) for each x-column
         column_patches = []
         for nz, iz in enumerate(zrange):
             for ny, iy in enumerate(yrange):
                 column_patches.append((nz, ny, iz, iy))
 
+        print("=" * 50)
+        print("Starting inference and assembly...")
+
         num_workers = len(self.workers)
-        # Use a persistent thread pool + a separate thread for assembly
+        batch_size = int(OmegaConf.select(self.cfg, 'model.batch_size') or 1)
+
         assemble_executor = ThreadPoolExecutor(max_workers=1)
+        write_executor = ThreadPoolExecutor(max_workers=1)
         assemble_future = None
 
         with tqdm(total=total_patches, desc="Processing") as pbar:
             with ThreadPoolExecutor(max_workers=num_workers) as infer_executor:
                 for nx, ix in enumerate(xrange):
+                    # Group patches of this column into chunks of `batch_size`
+                    batch_patches = [column_patches[i:i+batch_size]
+                              for i in range(0, len(column_patches), batch_size)]
                     futures = {}
-                    for idx, (nz, ny, iz, iy) in enumerate(column_patches):
+                    for idx, batch_patch in enumerate(batch_patches):
                         gpu_id = idx % num_workers
+                        start_index = [[iz, iy, ix] for (_, _, iz, iy) in batch_patch]
                         fut = infer_executor.submit(
                             self.workers[gpu_id].run,
-                            x0,
-                            startIdx_zyx=[iz, iy, ix],
-                            patchShape_zyx=[dz, dy, dx],
-                            ii=(iz, iy, ix)
+                            imgs,
+                            start_index=start_index,
+                            patch_shape=patch_shape,
                         )
-                        futures[fut] = (nz, ny)
+                        # map future -> list of (nz, ny) in chunk order
+                        futures[fut] = [(nz, ny) for (nz, ny, _, _) in batch_patch]
 
                     # Collect results (order doesn't matter for store_patch)
                     for fut in as_completed(futures):
-                        nz, ny = futures[fut]
-                        outall, Xup, outstd = fut.result()
-                        # outall: (Z, C, Y, X, aug) # (256, 1, 256, 256, 2)
-                        # Xup: (Z, C, Y, X) # (256, 1, 256, 256)
-                        # outstd: (Z, C, Y, X) # (256, 1, 256, 256) MC std
-                        if 'xy' in assemblers:
-                            assemblers['xy'].store_patch(nz, ny, outall, is_outall=True)
-                        if 'ori' in assemblers:
-                            assemblers['ori'].store_patch(nz, ny, Xup, is_outall=False)
-                        if 'xystd' in assemblers:
-                            assemblers['xystd'].store_patch(nz, ny, outstd, is_outall=False)
-                        pbar.update(1)
+                        nz_ny_list = futures[fut]
+                        for (nz, ny), (XupX, Xup, _) in zip(nz_ny_list, fut.result()):
+                            # XupX: (Z, C, X, Y) — already normalized mean
+                            # Xup:     (Z, C, X, Y)
+                            if 'xy' in assemblers:
+                                assemblers['xy'].store_patch(nz, ny, XupX)
+                            if 'ori' in assemblers:
+                                assemblers['ori'].store_patch(nz, ny, Xup)
+                            pbar.update(1)
 
-                    # Snapshot patches and reset - so next column can store immediately
+                    # Snapshot patches and reset — so next column can store immediately
                     patches_snapshots = {}
                     for target, asm in assemblers.items():
                         patches_snapshots[target] = asm.patches
@@ -701,54 +756,47 @@ class InferencePipeline:
                     if assemble_future is not None:
                         assemble_future.result()
 
-                    # Launch assembly in background with snapshot
+                    # Launch assembly in background with snapshot; assemble_column
+                    # dispatches disk write to write_executor so the two stages pipeline.
                     def _assemble(assemblers, snapshots, nx):
                         for target, asm in assemblers.items():
-                            asm.assemble_column(nx, patches=snapshots[target])
+                            asm.assemble_column(nx, patches=snapshots[target],
+                                                write_executor=write_executor)
 
                     assemble_future = assemble_executor.submit(
                         _assemble, assemblers, patches_snapshots, nx
                     )
 
-        # Wait for the last column's assembly
+        # Wait for the last column's assembly, then drain pending writes
         if assemble_future is not None:
             assemble_future.result()
         assemble_executor.shutdown(wait=True)
+        write_executor.shutdown(wait=True)
 
         if self.cfg.output.output_format == 'tiff':
             for target, asm in assemblers.items():
                 if hasattr(asm, 'output_path'):
-                    print(
-                        f"[tiff] {target} assembly complete: {', '.join(asm.output_path + '_' + str(c) for c in range(asm.output_channel))}")
+                    print(f"[tiff] {target} assembly complete: {', '.join(asm.output_path + '_' + str(c) for c in range(asm.output_channel))}")
 
         if self.cfg.output.output_format == 'zarr':
             for target, asm in assemblers.items():
                 if hasattr(asm, 'zarr_path'):
                     print(f"[zarr] {target} assembly complete: {asm.zarr_path}")
 
-        print(f"Done! Output saved to: {self.dest}")
-
 
 # =============================================================================
 # Main
 # =============================================================================
-def parse_args():
-    parser = argparse.ArgumentParser(description='Microscopy inference + assembly')
-    parser.add_argument('--env', type=str, required=True,
-                        help='Environment name from env.yaml (e.g. Docker, GHCL00, ...)')
-    parser.add_argument('--scale', type=str, required=True, choices=['2x', '4x', '8x'],
-                        help='Scale config name from cfg/scale/')
-    parser.add_argument('--override', type=str, default=None,
-                        help='Override config file name in `cfg/` (without `.yaml`)')
+def main():
+    parser = argparse.ArgumentParser(description='Microscopy Patch Inference & Assembly')
+    parser.add_argument('--env', type=str, required=True, help='Environment name from env.yaml (e.g. Docker, GHCL00, ...)')
+    parser.add_argument('--scale', type=str, required=True, choices=['2x', '4x', '8x'], help='Scale config name from cfg/scale/')
+    parser.add_argument('--override', type=str, default=None, help='Override config file name in `cfg/` (without `.yaml`)')
     parser.add_argument('--cpu', action='store_true', help='Use CPU instead of GPU')
 
     args, cli_overrides = parser.parse_known_args()
     args.cli_overrides = cli_overrides
-    return args
 
-
-def main():
-    args = parse_args()
     pipeline = InferencePipeline(args)
     pipeline.run()
 
