@@ -3,6 +3,7 @@ import os
 import shutil
 import numpy as np
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.nn.functional as F
 import tifffile as tiff
 from omegaconf import OmegaConf
@@ -60,9 +61,6 @@ class Config:
         # Resolve all interpolations
         OmegaConf.resolve(cfg)
 
-        if cfg.paths.version is None:
-            cfg.paths.version = ''
-
         # Validate required paths
         required = ['input_img_relpath', 'ckpt_relpath', 'output_dir_name']
         missing = [k for k in required if OmegaConf.select(cfg, f'paths.{k}') is None]
@@ -72,7 +70,7 @@ class Config:
         # Build runtime paths with os.path.join (avoids double-slash issues)
         cfg.runtime = OmegaConf.create({
             'input_img_path': os.path.join(cfg.env.DATASET, cfg.paths.input_img_relpath),
-            'ckpt_root_path': os.path.join(cfg.env.MODEL, cfg.paths.ckpt_relpath, cfg.paths.version),
+            'ckpt_root_path': os.path.join(cfg.env.MODEL, cfg.paths.ckpt_relpath),
             'output_dir': os.path.join(cfg.env.RESULT, cfg.paths.output_dir_name),
         })
 
@@ -172,7 +170,7 @@ class ModelLoader:
 
     def _load_gan(self, ckpt_root_path, epoch):
         model_path = os.path.join(ckpt_root_path, f"net_g_model_epoch_{epoch}.pth")
-        return torch.load(model_path, map_location='cpu', weights_only=False)
+        return torch.load(model_path, map_location='cpu')
 
     def _load_vqq2(self, ckpt_root_path, epoch):
         return VQQModel(ckpt_root_path, epoch)
@@ -254,7 +252,7 @@ class ImageLoader:
         if crop_margin is not None:
             Cz, Cy, Cx = crop_margin
             z_ratio = self.cfg.scale
-            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//z_ratio, Cz//z_ratio), mode='constant', value=self.img.mean())
+            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//z_ratio, Cz//z_ratio), mode='constant', value=self.img.min())
             _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X)
             print(f"After C padding size (Z, Y, X): {(self.img.shape[2], self.img.shape[3], self.img.shape[4])}")
 
@@ -266,7 +264,7 @@ class ImageLoader:
         Ny = (Dy // ystep) * ystep + dy
         Nx = (Dx // xstep) * xstep + dx
         Pz, Py, Px = Nz - Dz, Ny - Dy, Nx - Dx
-        self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.mean())
+        self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.min())
         print(f"After stride padding size (Z, Y, X): {(self.img.shape[2], self.img.shape[3], self.img.shape[4])}")
 
         return self.img # (1, 1, Z, Y, X)
@@ -304,7 +302,10 @@ class PatchProcessor:
         for img in imgs:
             patch = [img[:, :, si[0]:si[0]+pz, si[1]:si[1]+py, si[2]:si[2]+px] for si in start_index]
             batch_patch = torch.cat(patch, dim=0)
+            nvtx.range_push("mem::ram_to_vram")
             batch_patch = batch_patch.to(self.device)
+            torch.cuda.synchronize(self.device)
+            nvtx.range_pop()  # mem::ram_to_vram
             per_channel.append(self.upsample(batch_patch))
 
         batch_input = torch.cat(per_channel, dim=1)
@@ -312,10 +313,10 @@ class PatchProcessor:
         if self.fp16 and self.gpu:
             batch_input = batch_input.half() # (B, C, Z, Y, X)
             with torch.amp.autocast('cuda'):
-                XupX, Xup, _ = self.model_proc.get_vqq_out_batch(
+                XupX, Xup, _ = self.model_proc.get_vqq_out_batch_nvtx(
                     batch_input, self.tta_method, ii=ii)
         else:
-            XupX, Xup, _ = self.model_proc.get_vqq_out_batch(
+            XupX, Xup, _ = self.model_proc.get_vqq_out_batch_nvtx(
                 batch_input, self.tta_method, ii=ii)
         # XupX: (B, Z, C, X, Y) — already normalized mean, CPU
         # Xup:  (B, Z, C, X, Y) — CPU
@@ -519,6 +520,7 @@ class PatchAssembler:
         `last_block` / `current_x_position` are updated before dispatch so the
         next column's assemble sees the correct state.
         """
+        nvtx.range_push("cpu::assemble")
         if patches is None:
             patches = self.patches
         Cz, Cy, Cx = self.Cz, self.Cy, self.Cx
@@ -567,6 +569,7 @@ class PatchAssembler:
         # X-axis blending: overlap Sx along axis 1
         if self.last_block is not None:
             one_zy_block[:, :Sx, :, :] += self.last_block
+        nvtx.range_pop()  # cpu::assemble
 
         # Snapshot write position, then update state BEFORE dispatching write
         # so the next column's assemble can start immediately with correct state.
@@ -576,10 +579,12 @@ class PatchAssembler:
 
         # Dispatch write (sync or async)
         def _write2disk():
+            nvtx.range_push("disk::write_output")
             if self.output_format == 'tiff':
                 self._write_column_tiff(one_zy_block, Sx, write_x_position)
             elif self.output_format == 'zarr':
                 self._write_column_zarr(one_zy_block, Sx, write_x_position)
+            nvtx.range_pop()  # disk::write_output
 
         if write_executor is not None:
             write_executor.submit(_write2disk)
@@ -654,7 +659,11 @@ class InferencePipeline:
 
     def run(self):
         # Load and preprocess image
+        nvtx.range_push("disk::load_image")
         self.image_loader.load_3d_img() # (Z, Y, X) # (237, 2763, 2756)
+        nvtx.range_pop()
+        
+        nvtx.range_push("cpu::preprocess")
         self.image_loader.apply_forward_norm() # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
         self.image_loader.apply_percentile_norm() # (1, 1, Z, Y, X) # (1, 1, 237, 2763, 2756)
 
@@ -670,6 +679,8 @@ class InferencePipeline:
         patch_shape = self.cfg.patch.patch_shape
         self.image_loader.pad(patch_shape=patch_shape, crop_margin=crop_margin) # (B, C, Z, Y, X) # (1, 1, 260, 2912, 2912)
         imgs = [self.image_loader.img]
+
+        nvtx.range_pop()  # cpu::preprocess
         
         # Get patch grid
         zrange, yrange, xrange = self._get_patch_grid(self.image_loader.img.shape)
@@ -771,6 +782,7 @@ class InferencePipeline:
             for target, asm in assemblers.items():
                 if hasattr(asm, 'zarr_path'):
                     print(f"[zarr] {target} assembly complete: {asm.zarr_path}")
+
 
 # =============================================================================
 # Main
