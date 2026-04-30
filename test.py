@@ -275,9 +275,10 @@ class ImageLoader:
 class PatchProcessor:
     """Handles inference on patches."""
 
-    def __init__(self, cfg, model_proc, upsample, device='cpu'):
+    def __init__(self, cfg, model_proc, upsample, resample, device='cpu'):
         self.model_proc = model_proc
         self.upsample = upsample
+        self.resample = resample
         self.tta_method = list(cfg.model.tta_method) * cfg.model.num_mc
         self.mc_threshold = cfg.model.mc_threshold
         self.compute_xystd = 'xystd' in cfg.output.save
@@ -285,8 +286,8 @@ class PatchProcessor:
         self.device = torch.device(device)
         self.gpu = (self.device.type == 'cuda')
 
-    def run(self, imgs, start_index, patch_shape, ii=None):
-        """Run inference on a batch of patches using get_vqq_out_batch.
+    def run(self, imgs, start_index, patch_shape, resample=None, ii=None):
+        """Run inference on a batch of patches.
 
         Args:
             start_index: list of [iz, iy, ix] starts, length B.
@@ -300,6 +301,9 @@ class PatchProcessor:
         per_channel = []
         for img in imgs:
             patch = [img[:, :, si[0]:si[0]+pz, si[1]:si[1]+py, si[2]:si[2]+px] for si in start_index]
+            if self.resample:
+                print(f"Applying resampling with factor {self.resample} to input patches...")
+                patch = [p[:, :, ::int(self.resample), :, :] for p in patch]
             batch_patch = torch.cat(patch, dim=0)
             batch_patch = batch_patch.to(self.device)
             per_channel.append(self.upsample(batch_patch))
@@ -308,21 +312,25 @@ class PatchProcessor:
 
         if self.fp16 and self.gpu:
             batch_input = batch_input.half() # (B, C, Z, Y, X)
-            with torch.amp.autocast('cuda'):
-                XupX, Xup, _ = self.model_proc.get_vqq_out_batch(
-                    batch_input, self.tta_method, ii=ii)
+
+        if self.compute_xystd:
+            XupX, Xup, outstd, _ = self.model_proc.get_vqq_out_batch_mc(
+                batch_input, self.tta_method, self.mc_threshold, ii=ii)
+            outstd = outstd.numpy().astype(np.float32)
         else:
             XupX, Xup, _ = self.model_proc.get_vqq_out_batch(
                 batch_input, self.tta_method, ii=ii)
+            outstd = None
         # XupX: (B, Z, C, X, Y) — already normalized mean, CPU
         # Xup:  (B, Z, C, X, Y) — CPU
+        # outstd: (B, Z, C, X, Y) or None
 
         XupX = XupX.numpy().astype(np.float32)
         Xup = Xup.numpy().astype(np.float32)
 
         results = []
         for b in range(B):
-            results.append((XupX[b], Xup[b], None))
+            results.append((XupX[b], Xup[b], None if outstd is None else outstd[b]))
         return results
 
 
@@ -599,8 +607,8 @@ class InferencePipeline:
         print("=" * 50)
 
         # Validate MC config
-        if self.cfg.model.num_mc > 1 and self.cfg.model.mc_threshold is None:
-            raise ValueError("num_mc > 1 requires mc_threshold to be set (note that mc_threshold is float, range is [-1, 1])")
+        if 'xystd' in self.cfg.output.save and self.cfg.model.mc_threshold is None:
+            raise ValueError("output.save contains 'xystd' but model.mc_threshold is not set")
 
         # Setup output directory
         self.dest = self.cfg.runtime.output_dir
@@ -624,7 +632,7 @@ class InferencePipeline:
             print(f"Loading model on {device}...")
             loader = ModelLoader(self.cfg, device=device)
             proc = PatchProcessor(
-                self.cfg, loader.model_proc, loader.upsample, device=device
+                self.cfg, loader.model_proc, loader.upsample, resample=self.cfg.patch.resample, device=device
             )
             self.workers.append(proc)
 
@@ -723,13 +731,16 @@ class InferencePipeline:
                     # Collect results (order doesn't matter for store_patch)
                     for fut in as_completed(futures):
                         nz_ny_list = futures[fut]
-                        for (nz, ny), (XupX, Xup, _) in zip(nz_ny_list, fut.result()):
+                        for (nz, ny), (XupX, Xup, outstd) in zip(nz_ny_list, fut.result()):
                             # XupX: (Z, C, X, Y) — already normalized mean
                             # Xup:     (Z, C, X, Y)
+                            # outstd:  (Z, C, X, Y) or None
                             if 'xy' in assemblers:
                                 assemblers['xy'].store_patch(nz, ny, XupX)
                             if 'ori' in assemblers:
                                 assemblers['ori'].store_patch(nz, ny, Xup)
+                            if 'xystd' in assemblers:
+                                assemblers['xystd'].store_patch(nz, ny, outstd)
                             pbar.update(1)
 
                     # Snapshot patches and reset — so next column can store immediately

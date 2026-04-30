@@ -13,6 +13,9 @@ grid:
     y: [0, 2048]
     x: [0, 2048]
 
+preprocess:
+  norm_method: ["00"]
+
 model:
   batch_size: 1
   epoch: 1700

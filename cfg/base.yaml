@@ -1,5 +1,6 @@
 patch:
-  patch_shape: null            # overridden by cfg/scale/{2x,4x,8x}.yaml
+  patch_shape: null           # overridden by cfg/scale/{2x,4x,8x}.yaml
+  resample: null            
   upsample_size: ${patch.patch_shape}
 
 assemble:

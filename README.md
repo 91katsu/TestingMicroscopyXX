@@ -232,22 +232,6 @@ python test.py --env GHCL00 --scale 8x --override THX10SDM20xw --cpu
 # Override individual parameters via CLI
 python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.fp16=True model.batch_size=9
 ```
-
-#### Profiling (`speed_test.py`)
-
-`speed_test.py` is the NVTX-instrumented twin of `test.py` (same CLI, same behavior). Run it under `nsys profile` to collect a `.nsys-rep` trace, then summarize stage timings with `analyze_profile.sh`:
-
-```bash
-# Profile a run (NVTX ranges: disk::load_image, cpu::preprocess, mem::ram_to_vram,
-# gpu::inference, mem::vram_to_ram, cpu::assemble, disk::write_output)
-nsys profile -t cuda,nvtx -o profile_result_H200_b16_fp16 \
-    python speed_test.py --env GHCL00 --scale 4x --override THX10SDM20xw \
-    model.fp16=True model.batch_size=16
-
-# Turn the trace into a Markdown NVTX summary table
-./analyze_profile.sh profile_result_H200_b16_fp16.nsys-rep "Batch_size=16, fp16"
-```
-
 **Arguments:**
 
 | Argument | Description | Default |
@@ -257,6 +241,20 @@ nsys profile -t cuda,nvtx -o profile_result_H200_b16_fp16 \
 | `--override` | Experiment config in `cfg/` (without `.yaml`) | `None` |
 | `--cpu` | Use CPU instead of GPU | off |
 | `key=value` | Additional CLI overrides (dot notation, e.g. `model.epoch=2000`) | — |
+
+#### Profiling (`speed_test.py`)
+
+`speed_test.py` is the NVTX-instrumented twin of `test.py` (same CLI, same behavior). Run it under `nsys profile` to collect a `.nsys-rep` trace, then summarize stage timings with `analyze_profile.sh`:
+
+```bash
+# Profile a run (NVTX ranges: disk::load_image, cpu::preprocess, mem::ram_to_vram, gpu::inference, mem::vram_to_ram, cpu::assemble, disk::write_output)
+nsys profile -t cuda,nvtx -o profile_result_H200_b16_fp16 \
+    python speed_test.py --env GHCL00 --scale 4x --override THX10SDM20xw \
+    model.fp16=True model.batch_size=16
+
+# Turn the trace into a Markdown NVTX summary table
+./analyze_profile.sh profile_result_H200_b16_fp16.nsys-rep "Batch_size=16, fp16"
+```
 
 ### Results
 
@@ -277,3 +275,7 @@ nsys profile -t cuda,nvtx -o profile_result_H200_b16_fp16 \
       npx http-server -p 8001 --cors='*'
       ```
   2. Then open `http://localhost:8001/xxx.zarr` in [Avivator](https://avivator.gehlenborglab.org).
+
+## Monte Carlo Uncertainty Estimation
+
+If you need Monte Carlo uncertainty boundary maps, see [here](monte_carlo.md) for usage instructions.
