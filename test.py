@@ -2,6 +2,7 @@ import argparse
 import os
 import shutil
 import numpy as np
+import math
 import torch
 import torch.nn.functional as F
 import tifffile as tiff
@@ -259,9 +260,13 @@ class ImageLoader:
         ystep = int(eval(str(self.cfg.grid.step.y)))
         xstep = int(eval(str(self.cfg.grid.step.x)))
 
-        Nz = (Dz // zstep) * zstep + dz
-        Ny = (Dy // ystep) * ystep + dy
-        Nx = (Dx // xstep) * xstep + dx
+        def pad_for_stride(D, p, s):
+            n = max(1, math.ceil((D - p) / s) + 1)
+            return (n - 1) * s + p
+
+        Nz = pad_for_stride(Dz, dz, zstep)
+        Ny = pad_for_stride(Dy, dy, ystep)
+        Nx = pad_for_stride(Dx, dx, xstep)
         Pz, Py, Px = Nz - Dz, Ny - Dy, Nx - Dx
         self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.min())
         print(f"After stride padding size (Z, Y, X): {(self.img.shape[2], self.img.shape[3], self.img.shape[4])}")
