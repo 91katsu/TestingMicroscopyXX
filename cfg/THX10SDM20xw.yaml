@@ -1,3 +1,11 @@
+# patch:
+#   patch_shape: [48, 384, 384]
+
+# assemble:
+#   C: [16, 16, 16]
+#   S: [16, 16, 16]    
+#   weight_shape: [352, 352, 352]
+
 grid:
   testwhole: True
   roi:
@@ -5,8 +13,13 @@ grid:
     y: [0, 2048]
     x: [0, 2048]
 
+preprocess:
+  norm_method: ["00"]
+
 model:
+  batch_size: 1
   epoch: 1700
+  fp16: true
   # num_mc: 5
   # mc_threshold: -0.6
   
@@ -15,8 +28,9 @@ output:
   # save: ["xystd"]
   save: ["ori", "xy"]
   output_datatype: "uint8"
+  # output_format: "zarr"
 
 paths:
   input_img_relpath: "THX10SDM20xw/roiDcrop2.tif"
   ckpt_relpath: "THX10SDM20xw/max5skip4/checkpoints"
-  output_dir_name: "THX10SDM20xw"
+  output_dir_name: "THX10SDM20xw_speedtest"

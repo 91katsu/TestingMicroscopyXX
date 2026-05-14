@@ -33,7 +33,9 @@ For a quick start, you can use our pre-built Docker image to run inference on ou
 ```
 TestingMicroscopyXX/
 ├── test.py                  # Main inference script
+├── speed_test.py            # NVTX-instrumented inference for profiling (nsys)
 ├── run.sh                   # Execution examples
+├── analyze_profile.sh       # Parse nsys .nsys-rep into a Markdown NVTX summary
 ├── requirements.txt         # Dependencies
 ├── cfg/                     # Configuration (OmegaConf / YAML)
 │   ├── base.yaml            # Default parameters
@@ -154,6 +156,7 @@ Defines all available parameters and their default values. Later config layers c
 |-----------|---------|-------------|
 | `type` | `"VQQ2"` | Model type: `AE`, `GAN`, `VQQ2` |
 | `epoch` | `500` | Checkpoint epoch to load |
+| `batch_size` | `1` | Number of patches per forward pass |
 | `hbranchz` | `true` | Use encoder posterior as h-branch input (VQQ2 only) |
 | `downbranch` | `null` (Set by scale config) | Downsampling factor. `1` for 8X SR, `2` for 4X SR, `4` for 2X SR |
 | `checking_codebook` | `true` | Log VQ codebook usage during inference (VQQ2 only) |
@@ -225,7 +228,7 @@ paths:
 Any parameter can be overridden directly from the command line using dot notation. CLI overrides are applied last, taking the highest priority:
 
 ```bash
-python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.epoch=2000 paths.output_dir_name="THX10SDM20xw_epoch2000"
+python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.fp16=True
 ```
 
 ### Usage
@@ -243,9 +246,8 @@ CUDA_VISIBLE_DEVICES=0,1 python test.py --env GHCL00 --scale 8x --override THX10
 python test.py --env GHCL00 --scale 8x --override THX10SDM20xw --cpu
 
 # Override individual parameters via CLI
-python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.epoch=2000 paths.output_dir_name="THX10SDM20xw_epoch2000"
+python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.fp16=True model.batch_size=9
 ```
-
 **Arguments:**
 
 | Argument | Description | Default |
@@ -255,6 +257,20 @@ python test.py --env GHCL00 --scale 4x --override THX10SDM20xw model.epoch=2000 
 | `--override` | Experiment config in `cfg/` (without `.yaml`) | `None` |
 | `--cpu` | Use CPU instead of GPU | off |
 | `key=value` | Additional CLI overrides (dot notation, e.g. `model.epoch=2000`) | — |
+
+#### Profiling (`speed_test.py`)
+
+`speed_test.py` is the NVTX-instrumented twin of `test.py` (same CLI, same behavior). Run it under `nsys profile` to collect a `.nsys-rep` trace, then summarize stage timings with `analyze_profile.sh`:
+
+```bash
+# Profile a run (NVTX ranges: disk::load_image, cpu::preprocess, mem::ram_to_vram, gpu::inference, mem::vram_to_ram, cpu::assemble, disk::write_output)
+nsys profile -t cuda,nvtx -o profile_result_H200_b16_fp16 \
+    python speed_test.py --env GHCL00 --scale 4x --override THX10SDM20xw \
+    model.fp16=True model.batch_size=16
+
+# Turn the trace into a Markdown NVTX summary table
+./analyze_profile.sh profile_result_H200_b16_fp16.nsys-rep "Batch_size=16, fp16"
+```
 
 ### Results
 

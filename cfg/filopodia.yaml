@@ -9,9 +9,14 @@ preprocess:
   norm_method: ["11"]
 
 model:
+  batch_size: 8
   epoch: 500
+  fp16: True
 
 paths:
   input_img_relpath: "filopodia_10X_G0431__6xGFP_incubator_10xSp_4d_Ch-GFP_G-ch-bio_SA635_1_Stitch/10X_G0431__6xGFP_incubator_10xSp_4d_Ch-GFP_G-ch-bio_SA635_1_Stitch.tif"
   ckpt_relpath: "logs/filopodia/default/max10skip4/checkpoints"
   output_dir_name: "filopodia"
+
+# output:
+#   output_format: "zarr"

@@ -77,7 +77,6 @@ class DataNormalization:
         assert self.backward_type in ["float32", "uint16", "uint8"]
 
     def forward_normalization(self, x0, norm_method, trd):
-        print('forward normalization:  ', norm_method)
         if norm_method == '11':
             if trd[0] != 'None' and trd[1] != 'None':
                 x0[x0 <= trd[0]] = trd[0]
