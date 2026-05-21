@@ -35,7 +35,7 @@ model:
 ```
 
 ```bash
-python test.py --env GHCL00 --scale 8x --override MyExperiment
+python test.py --env MyEnv --scale 8x --override MyExperiment
 ```
 
 Note that `mc_threshold` operates in the same float32 range as `xy`. We recommend setting `output_datatype: "float32"` for this first run so that thresholding can be performed directly in `ImageJ`, `Fiji`, or `napari` without additional rescaling; otherwise, when using `uint8` or `uint16`, the data must be converted to float32 before thresholding.
