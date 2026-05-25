@@ -1,6 +1,7 @@
 import argparse
 import os
 import shutil
+import time
 import numpy as np
 import math
 import torch
@@ -10,6 +11,7 @@ from omegaconf import OmegaConf
 import zarr
 from ome_zarr.writer import write_multiscales_metadata
 from tqdm import tqdm
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils.model_utils import read_json_to_args, import_model, load_pth, ModelProcesser
@@ -252,7 +254,7 @@ class ImageLoader:
         if crop_margin is not None:
             Cz, Cy, Cx = crop_margin
             z_ratio = self.cfg.scale
-            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//z_ratio, Cz//z_ratio), mode='constant', value=self.img.min())
+            self.img = F.pad(self.img, (Cx, Cx, Cy, Cy, Cz//z_ratio, Cz//z_ratio), mode='constant', value=self.img.mean())
             _, _, Dz, Dy, Dx = self.img.shape # (1, 1, Z, Y, X)
             print(f"After C padding size (Z, Y, X): {(self.img.shape[2], self.img.shape[3], self.img.shape[4])}")
 
@@ -268,7 +270,7 @@ class ImageLoader:
         Ny = pad_for_stride(Dy, dy, ystep)
         Nx = pad_for_stride(Dx, dx, xstep)
         Pz, Py, Px = Nz - Dz, Ny - Dy, Nx - Dx
-        self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.min())
+        self.img = F.pad(self.img, (0, Px, 0, Py, 0, Pz), mode='constant', value=self.img.mean())
         print(f"After stride padding size (Z, Y, X): {(self.img.shape[2], self.img.shape[3], self.img.shape[4])}")
 
         return self.img # (1, 1, Z, Y, X)
@@ -343,6 +345,18 @@ class PatchProcessor:
 # PatchAssembler
 # =============================================================================
 class PatchAssembler:
+    """Per-column assembler with no cross-column blending.
+
+    Each column writes its full block (including BOTH leading and trailing Sx
+    overlap regions) to its own storage location. X-axis taper-blending across
+    columns is deferred to an external post-processing step.
+
+    Post-processing contract:
+        Adjacent columns' overlap regions are stored as *complementary tapered*
+        values (column N's trailing Sx tapers 1→0, column N+1's leading Sx
+        tapers 0→1, weights sum to 1). The post-processor must ADD them, not
+        pick one, to recover full intensity.
+    """
 
     def __init__(self, cfg, target_name, zrange, xrange, yrange):
         self.Cz, self.Cy, self.Cx = cfg.assemble.C
@@ -357,8 +371,6 @@ class PatchAssembler:
         self.yrange = yrange
 
         self.patches = {}
-        self.last_block = None
-        self.current_x_position = 0
         self._weight_cache = {}
 
         # Setup output
@@ -369,11 +381,14 @@ class PatchAssembler:
             self._init_zarr_store()
 
     def _init_tiff_dirs(self):
+        nx_count = len(self.xrange)
         for c in range(self.output_channel):
             d = self.output_path + '_' + str(c)
             if os.path.exists(d):
                 shutil.rmtree(d)
             os.makedirs(d, exist_ok=True)
+            for nx in range(nx_count):
+                os.makedirs(os.path.join(d, f'col_{nx:03d}'), exist_ok=True)
 
     def _init_zarr_store(self):
         Wz, Wy, Wx = self.weight_shape
@@ -382,7 +397,9 @@ class PatchAssembler:
         nx = len(self.xrange)
         fZ = int(Wz * nz - self.Sz * (nz - 1))
         fY = int(Wy * ny - self.Sy * (ny - 1))
-        fX = int(Wx * nx - self.Sx * (nx - 1) - self.Sx)
+        # No cross-column X blending: each column occupies a full Wx slab,
+        # adjacent columns' overlaps live side-by-side and are merged downstream.
+        fX = int(Wx * nx)
 
         save_dtype = np.dtype(self.output_datatype)
 
@@ -440,24 +457,26 @@ class PatchAssembler:
             "rdefs": {"defaultT": 0, "defaultZ": 0, "model": "greyscale"},
         }
 
-    def _write_column_tiff(self, one_zy_block, Sx, x_position):
-        """Write assembled column as per-X-position TIFF slices."""
-        for x in range(0, one_zy_block.shape[1] - Sx):
+    def _write_column_tiff(self, one_zy_block, nx):
+        """Write full column (incl. both Sx overlaps) under per-column subdir."""
+        for x in range(one_zy_block.shape[1]):
             for c in range(one_zy_block.shape[0]):
                 slice_data = one_zy_block[c, x, :, :]
                 slice_data = self._convert_dtype(slice_data)
                 tiff.imwrite(
                     os.path.join(self.output_path + '_' + str(c),
-                                 'slice_x_' + str(x_position + x).zfill(4) + '.tif'),
+                                 f'col_{nx:03d}',
+                                 f'slice_x_{x:04d}.tif'),
                     slice_data
                 )
 
-    def _write_column_zarr(self, one_zy_block, Sx, x_position):
-        """Write assembled column block to zarr store."""
-        block = one_zy_block[:, :one_zy_block.shape[1] - Sx, :, :]
-        block = self._convert_dtype(block)
-        x_len = block.shape[1]
-        self.zarr_out[0, :, x_position:x_position + x_len, :, :] = block
+    def _write_column_zarr(self, one_zy_block, nx):
+        """Write full column block at [nx*Wx : (nx+1)*Wx] in zarr store."""
+        block = self._convert_dtype(one_zy_block)
+        Wx = self.weight_shape[2]
+        x_start = nx * Wx
+        x_end = x_start + one_zy_block.shape[1]
+        self.zarr_out[0, :, x_start:x_end, :, :] = block
 
     def _convert_dtype(self, data):
         """Convert float32 data to target dtype."""
@@ -522,17 +541,19 @@ class PatchAssembler:
         self.patches[(nz, ny)] = patch
 
     def assemble_column(self, nx, patches=None, write_executor=None):
-        """Assemble all patches for X-column index nx and write output.
+        """Assemble Y/Z-blended column at index nx and write the full block.
 
-        If `write_executor` is provided, the disk write is dispatched to it
-        (non-blocking) so the next column's assemble can start immediately.
-        `last_block` / `current_x_position` are updated before dispatch so the
-        next column's assemble sees the correct state.
+        Y/Z blending happens in-RAM as before. X-axis blending is NOT performed
+        here — the full column (incl. both Sx overlaps) is written as-is, and
+        adjacent columns are merged in a separate post-processing pass.
+
+        Columns are now fully independent — multiple `assemble_column` calls
+        can run concurrently with no shared mutable state.
         """
         if patches is None:
             patches = self.patches
         Cz, Cy, Cx = self.Cz, self.Cy, self.Cx
-        Sz, Sy, Sx = self.Sz, self.Sy, self.Sx
+        Sz, Sy = self.Sz, self.Sy
         nz_count = len(self.zrange)
         ny_count = len(self.yrange)
         nx_count = len(self.xrange)
@@ -541,7 +562,7 @@ class PatchAssembler:
         for nz in range(nz_count):
             one_column = []
             for ny in range(ny_count):
-                # Edge flags: 
+                # Edge flags:
                 # 0 = first patch, -1 = last patch
                 nz_flag = -1 if nz == nz_count - 1 else nz
                 nx_flag = -1 if nx == nx_count - 1 else nx
@@ -572,24 +593,14 @@ class PatchAssembler:
             else:
                 one_zy_block.append(one_column)
 
-        one_zy_block = np.concatenate(one_zy_block, axis=2)  # (C, X, Z_total, Y_total) float32
+        one_zy_block = np.concatenate(one_zy_block, axis=2)  # (C, X=Wx, Z_total, Y_total)
 
-        # X-axis blending: overlap Sx along axis 1
-        if self.last_block is not None:
-            one_zy_block[:, :Sx, :, :] += self.last_block
-
-        # Snapshot write position, then update state BEFORE dispatching write
-        # so the next column's assemble can start immediately with correct state.
-        write_x_position = self.current_x_position
-        self.last_block = one_zy_block[:, -Sx:, :, :].copy()
-        self.current_x_position += one_zy_block.shape[1] - Sx
-
-        # Dispatch write (sync or async)
+        # X-blending intentionally skipped — see class docstring.
         def _write2disk():
             if self.output_format == 'tiff':
-                self._write_column_tiff(one_zy_block, Sx, write_x_position)
+                self._write_column_tiff(one_zy_block, nx)
             elif self.output_format == 'zarr':
-                self._write_column_zarr(one_zy_block, Sx, write_x_position)
+                self._write_column_zarr(one_zy_block, nx)
 
         if write_executor is not None:
             write_executor.submit(_write2disk)
@@ -709,10 +720,12 @@ class InferencePipeline:
 
         num_workers = len(self.workers)
         batch_size = int(OmegaConf.select(self.cfg, 'model.batch_size') or 1)
-
         assemble_executor = ThreadPoolExecutor(max_workers=1)
-        write_executor = ThreadPoolExecutor(max_workers=1)
-        assemble_future = None
+
+        MAX_ASSEMBLE_QUEUE_LENGTH = 4
+        assemble_futures = deque()
+        backpressure_count = 0
+        backpressure_total_s = 0.0
 
         with tqdm(total=total_patches, desc="Processing") as pbar:
             with ThreadPoolExecutor(max_workers=num_workers) as infer_executor:
@@ -754,26 +767,50 @@ class InferencePipeline:
                         patches_snapshots[target] = asm.patches
                         asm.patches = {}  # fresh dict for next column
 
-                    # Wait for previous assembly (it uses last_block for X-blending)
-                    if assemble_future is not None:
-                        assemble_future.result()
-
-                    # Launch assembly in background with snapshot; assemble_column
-                    # dispatches disk write to write_executor so the two stages pipeline.
                     def _assemble(assemblers, snapshots, nx):
                         for target, asm in assemblers.items():
                             asm.assemble_column(nx, patches=snapshots[target],
-                                                write_executor=write_executor)
+                                                write_executor=None)
 
-                    assemble_future = assemble_executor.submit(
+                    while assemble_futures and assemble_futures[0].done():
+                        assemble_futures.popleft().result()
+
+                    if len(assemble_futures) >= MAX_ASSEMBLE_QUEUE_LENGTH:
+                        tqdm.write(
+                            f"[backpressure] assemble queue full "
+                            f"({len(assemble_futures)}/{MAX_ASSEMBLE_QUEUE_LENGTH}) "
+                            f"at column nx={nx} — GPU stalled, waiting on oldest assemble"
+                        )
+                        t_block = time.time()
+                        while len(assemble_futures) >= MAX_ASSEMBLE_QUEUE_LENGTH:
+                            assemble_futures.popleft().result()
+                        blocked_s = time.time() - t_block
+                        tqdm.write(f"[backpressure] unblocked after {blocked_s:.2f}s")
+                        backpressure_count += 1
+                        backpressure_total_s += blocked_s
+
+                    assemble_futures.append(assemble_executor.submit(
                         _assemble, assemblers, patches_snapshots, nx
-                    )
+                    ))
 
-        # Wait for the last column's assembly, then drain pending writes
-        if assemble_future is not None:
-            assemble_future.result()
+        if assemble_futures:
+            t_drain = time.time()
+            while assemble_futures:
+                assemble_futures.popleft().result()
+                print(f"[final drain] ({len(assemble_futures)}/{MAX_ASSEMBLE_QUEUE_LENGTH}) remaining")
+            print(f"[final drain] all assembles done after {time.time()-t_drain:.2f}s")
         assemble_executor.shutdown(wait=True)
-        write_executor.shutdown(wait=True)
+
+        if backpressure_count == 0:
+            print("[backpressure] never triggered — assemble kept up with inference")
+        else:
+            print(
+                f"[backpressure] triggered {backpressure_count} time(s), "
+                f"total GPU stall: {backpressure_total_s:.2f}s "
+                f"(avg {backpressure_total_s/backpressure_count:.2f}s/event). "
+                f"Consider raising MAX_ASSEMBLE_QUEUE_LENGTH if RAM allows, or "
+                f"max_workers if a single assemble is slow."
+            )
 
         if self.cfg.output.output_format == 'tiff':
             for target, asm in assemblers.items():

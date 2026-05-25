@@ -17,7 +17,7 @@ preprocess:
   norm_method: ["00"]
 
 model:
-  batch_size: 1
+  batch_size: 5
   epoch: 1700
   fp16: true
   # num_mc: 5
@@ -32,5 +32,6 @@ output:
 
 paths:
   input_img_relpath: "THX10SDM20xw/roiDcrop2.tif"
+  # input_img_relpath: "THX10/roiD.tif"
   ckpt_relpath: "THX10SDM20xw/max5skip4/checkpoints"
-  output_dir_name: "THX10SDM20xw_speedtest"
+  output_dir_name: "THX10SDM20xw_defer-x-blending_THX10SDM20xw"
